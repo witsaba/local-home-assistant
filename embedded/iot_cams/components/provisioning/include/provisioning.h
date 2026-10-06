@@ -184,6 +184,26 @@ void provisioning_reset_sta_state(void);
  * Returns ESP_OK on success, or the underlying httpd_start error. */
 esp_err_t provisioning_start_sta_server(void);
 
+/* Called from app_main's supervisor loop every tick. Owns the
+ * no-IP watchdog and emits the heartbeat log. */
+esp_err_t provisioning_supervise_sta(void);
+
+/* Monotonic count of reconnect attempts issued since boot.
+ * Never reset during the device lifetime.
+ * Safe to call from any task; reads are atomic.
+ * Exposed so the /health endpoint can report it to the operator. */
+uint32_t provisioning_reconnect_count(void);
+
+/* wifi_event_sta_disconnected_t.reason from the last disconnect,
+ * or 0 if none since boot.
+ * Safe to call from any task; reads are atomic. */
+uint8_t provisioning_last_disconnect_reason(void);
+
+/* Application firmware version recorded at provisioning_init()
+ * from provisioning_app_info_t.fw_version. Never NULL.
+ * Mirrors the existing prov_device_name() seam. */
+const char *prov_fw_version(void);
+
 #ifdef __cplusplus
 }
 #endif

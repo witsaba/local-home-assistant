@@ -221,7 +221,13 @@ void app_main(void)
 
         ESP_LOGI(TAG, "entering supervisor loop");
         while (1) {
-            vTaskDelay(pdMS_TO_TICKS(60000));
+            /* Call the provisioning supervisor on every tick. The
+             * supervisor owns the no-IP watchdog (forces reconnect
+             * after 60 s without an IP) and emits a heartbeat log
+             * every 30 s so the operator can confirm the loop is
+             * alive. */
+            (void)provisioning_supervise_sta();
+            vTaskDelay(pdMS_TO_TICKS(30000));
         }
     }
 
@@ -288,6 +294,11 @@ void app_main(void)
 
     ESP_LOGI(TAG, "post-provisioning: entering supervisor loop");
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(60000));
+        /* Call the provisioning supervisor on every tick. Belt
+         * and braces over the reconnect task — the supervisor
+         * additionally forces esp_wifi_connect() after 60 s
+         * without an IP. */
+        (void)provisioning_supervise_sta();
+        vTaskDelay(pdMS_TO_TICKS(30000));
     }
 }
