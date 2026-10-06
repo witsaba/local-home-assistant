@@ -266,12 +266,161 @@ Response:
 
 ```json
 {
+  "mac": "e08cfe3091b0",
   "name": "iot-cam",
-  "fw_version": "0.1.0",
-  "softap_ssid": "IoT-Cam_3091B0",
-  "softap_security": "WIFI_AUTH_WPA2_PSK"
+  "fw": "0.1.0",
+  "idf": "v5.5.3",
+  "chip": "ESP32-D0WDQ6",
+  "ip": "192.168.1.51",
+  "rssi": -51,
+  "uptime_s": 3012
 }
 ```
+
+`fw` is the **application** firmware version, recorded from
+`provisioning_app_info_t.fw_version` at `provisioning_init()` and
+served through the `prov_fw_version()` seam. It used to report
+`esp_get_idf_version()` instead, which meant an operator could not
+tell what firmware a device was running — precisely the thing
+needed during an incident. The ESP-IDF version is still available,
+under `idf`.
+
+`ip`, `rssi`, and `uptime_s` are live state rather than identity.
+They degrade gracefully when the station is down: `rssi` becomes
+`-1` and `ip` becomes `0.0.0.0`.
+
+The response is assembled with `snprintf` into a 256-byte buffer and
+an explicit overflow guard that returns `500` rather than
+truncating. If you add a field, grow the buffer in the same commit.
+
+---
+
+## Diagnostics endpoint: `/health`
+
+Registered on the same STA httpd handle as `/whoami` and
+`/capture`. Same audience: post-provisioning LAN clients, plus the
+Pi monitoring agent.
+
+```bash
+curl -s http://<camera-ip>/health
+```
+
+```json
+{
+  "uptime_ms": 301234,
+  "free_heap": 120432,
+  "min_free_heap": 89200,
+  "free_psram": 1966080,
+  "ip": "192.168.1.51",
+  "rssi": -51,
+  "reconnect_count": 3,
+  "last_disconn_rc": 201,
+  "ws_viewer": 0
+}
+```
+
+The point of this endpoint is to separate three failure shapes that
+look identical from outside — a device that answers nothing at all:
+
+| Observation | Meaning |
+| --- | --- |
+| `ip` = `0.0.0.0` | The station is off-network. The link dropped and did not recover. |
+| `ip` present, `min_free_heap` low and falling | The httpd is alive but starved. Pool or heap exhaustion. |
+| `ip` present, healthy heap | Neither. Look at the heartbeat log or the caller. |
+
+It never returns `500`. `esp_wifi_sta_get_ap_info` and
+`esp_netif_get_ip_info` failures degrade to `rssi` = `-1` and `ip` =
+`0.0.0.0`, because a device that is off-network is exactly the case
+where `/health` has to still answer.
+
+`last_disconn_rc` is the `wifi_event_sta_disconnected_t.reason`
+enum. `201` is `WIFI_REASON_AUTH_EXPIRE`, `202` is
+`WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT`, `203` is
+`WIFI_REASON_BEACON_TIMEOUT`. See `esp_wifi_types_generic.h` for
+the full table — a persistent `203` means the AP stopped hearing
+beacons, which is a coverage problem, not a firmware one.
+
+---
+
+## Network liveness
+
+### What the device does when the link drops
+
+Reconnection is owned by a dedicated FreeRTOS task, `sta_reconnect`,
+and never by an event handler. `WIFI_EVENT_STA_DISCONNECTED` is
+dispatched on the `esp_event` task, so anything that blocks there
+stalls **every** event in the system, including IP and WiFi events.
+The handler is therefore O(1): record the reason, clear
+`s_sta_got_ip`, set the pending flag, poke the task, return.
+
+The task blocks on `ulTaskNotifyTake(pdTRUE, portMAX_DELAY)`, so a
+healthy device spends no CPU on it. When poked it retries
+**forever** at 2 / 4 / 8 / 16 / 30 s, capped at 30 s, resetting when
+the station re-attaches. There is deliberately no attempt ceiling:
+a device that stops retrying is the failure mode, not the fix.
+
+In the log, `reconnect: esp_wifi_connect (backoff=Xms)` always means
+"this attempt followed a sleep of X ms". The very first attempt after
+a disconnect logs `attempt after disconnect` with no backoff label,
+because it did not sleep.
+
+`provisioning_supervise_sta()` is a separate 120 s backstop. It is
+not part of the retry cadence — if the reconnect task is stuck, the
+supervisor forces one `esp_wifi_connect()` so a wedged task cannot
+become an outage.
+
+### Heartbeat
+
+`provisioning_supervise_sta()` also emits a periodic heartbeat
+carrying the same fields as `/health`:
+
+- station has an IP: every 10 ticks (~5 min)
+- station has no IP: every tick (30 s)
+
+The unhealthy cadence is deliberately chatty. An operator
+diagnosing an outage needs to see the disconnect happen, not infer
+it from silence.
+
+### WiFi power save
+
+`esp_wifi_set_ps(WIFI_PS_NONE)` is called after `esp_wifi_start()`
+on both boot paths. The ESP-IDF default is `WIFI_PS_MIN_MODEM`,
+which AP-buffers upstream ARP, ICMP, and DHCP traffic during DTIM
+sleep. That is the right trade for a battery device and the wrong
+one for a mains-powered camera that must always answer on the LAN.
+
+### Task priority invariant
+
+```
+wifi_task (23) > esp_event (20) > httpd (5) > cam_stream (3)
+```
+
+The camera stream producer runs every 100 ms and does a full PSRAM
+capture plus JPEG encode. If it outranks the httpd workers, `/whoami`
+and `/capture` starve while the device looks alive. `cam_stream` is
+deliberately below `httpd` for that reason; if you add a task that
+serves a client-facing endpoint, put it at 5 or above.
+
+### Operator recovery procedure
+
+When a camera stops answering any endpoint:
+
+1. `ping <ip>`. A reply means the link and IP are alive and the
+   httpd is wedged — check `/health` heap numbers and whether the
+   `/stream` CCTV grid was open. No reply, or an absent/stale ARP
+   entry, means the station dropped off.
+2. On the serial console, `reconnect: esp_wifi_connect` lines mean
+   the station is actively retrying; `station connected ... ip=`
+   means it recovered. Silence with no reconnect lines means the
+   disconnect handler never fired — check whether the device is
+   still associated (AP client list) and look for a
+   `disconnected after IP was acquired` line, which would mean this
+   build is not running.
+3. There is no remote reboot endpoint, so recovery requires physical
+   access. See "Follow-ups" in
+   [`odd/tasks/iot-cams-network-liveness.md`](../../../../odd/tasks/iot-cams-network-liveness.md)
+   for the deferred `/reboot` proposal and why it needs an explicit
+   security decision first.
 
 ---
 

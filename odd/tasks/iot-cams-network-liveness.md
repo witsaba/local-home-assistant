@@ -167,13 +167,63 @@ English artifacts.
 
 | Task | Commit | Build | Notes |
 | --- | --- | --- | --- |
-| T1 | — | pending | — |
-| T2 | — | pending | — |
-| T3 | — | pending | — |
-| T4 | — | pending | — |
-| T5 | — | pending | — |
-| T6 | — | pending | — |
-| T7 | — | pending | — |
+| T1+T2+T3 | `d6a3eca` | verified at `5657642` | Shipped as one commit: all three touch the same WiFi state machine in `provisioning.c` and are not separable by file. Coherent as "the station recovers and proves liveness". |
+| T4 | `9c3be8c` | verified at `5657642` | Isolated as its own commit by splitting `sta_server.c` at the hunk boundary, so the capacity fix is reviewable apart from the additive observability. |
+| T5+T6 | `5657642` | **exit 0, zero warnings** | Both endpoints live in `sta_server.c` and share the buffer-resize rationale. |
+| T7 | (this commit) | n/a (docs) | — |
+
+### Build verification
+
+`idf.py fullclean && idf.py build`, ESP-IDF v5.5.3, parent-run:
+
+```
+iot_cams.bin binary size 0x100a50 bytes.
+Smallest app partition is 0x180000 bytes. 0x7f5b0 bytes (33%) free.
+Project build complete.
+```
+
+- Exit code **0**
+- `warning:` / `error:` lines across the full build log: **0**
+- Binary `0x100a50` (1 049 680 B), +4 288 B over the `main` baseline `0xff590`
+- 33 % of the 1.5 MB app partition still free
+- `sdkconfig*`, `partitions.csv`, and every `CMakeLists.txt` unchanged
+
+### Review findings corrected during implementation
+
+The first implementation pass built clean but carried two
+showstopping defects, caught in review and fixed before any commit:
+
+1. **`sta_reconnect_task` busy-spun a core in steady state.** With
+   `s_sta_disconnected_pending == false` the task `continue`d to the
+   top of the loop with no blocking call anywhere on that path. At
+   priority 4 it starved `cam_stream` at priority 3, which would
+   have killed the WebSocket stream on every device from boot —
+   worse than the outage being fixed. Now blocks on
+   `ulTaskNotifyTake(pdTRUE, portMAX_DELAY)`.
+2. **The first reconnect attempt was delayed ~30 minutes.** The
+   inner `while (pending && elapsed < 1800000UL)` slept before doing
+   anything, so the 2/4/8/16/30 s backoff was computed *after* that
+   wait and never governed the cadence. Also masked by the
+   supervisor calling `esp_wifi_connect()` on every tick, which had
+   inverted the plan's ownership: the supervisor, not the task, was
+   restoring the link.
+
+Also corrected: `s_reconnect_count` was incremented in two places
+(now owned solely by the task); the "heartbeat" logged exactly once
+per boot instead of periodically, which would have left a wedged
+device indistinguishable from a healthy one in the log; and the first
+reconnect attempt logged a `backoff=2000ms` label while actually
+sleeping 4 s.
+
+## Acceptance status
+
+| # | Criterion | Status |
+| --- | --- | --- |
+| 1 | `idf.py build` exit 0, zero warnings, clean build dir | **PASS** |
+| 2 | No new managed dependency | **PASS** — `dependencies.lock` untouched |
+| 3 | Diff touches only the listed files | **PASS** — 6 files, +779/-85 vs `main` |
+| 4 | README documents `/health`, reconnect behaviour, priority invariant, recovery procedure | **PASS** — also corrected the `/whoami` section, which documented a softAP-era contract the code never had |
+| 5 | Hardware verification | **PENDING — operator-gated.** Not claimed. |
 
 ## Follow-ups (not in this branch)
 
