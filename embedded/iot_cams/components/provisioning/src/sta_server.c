@@ -50,14 +50,126 @@
 #include "esp_system.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_heap_caps.h"
 
 #include "cam_reader.h"
 #include "ws_cams.h"
+
+/* Forward declarations for provisioning diagnostics accessors.
+ * These live in provisioning.c behind provisioning.h's public
+ * seam so they are accessible to /health without pulling esp_wifi
+ * into the sta_server TU. */
+extern const char  *prov_fw_version(void);
+extern uint32_t    provisioning_reconnect_count(void);
+extern uint8_t     provisioning_last_disconnect_reason(void);
+
+/* Forward declaration for the ws_cams viewer fd accessor. */
+extern int ws_cams_viewer_fd_get(void);
 
 static const char *TAG = "sta_srv";
 
 /* The httpd handle. NULL when not running. */
 static httpd_handle_t s_sta_httpd = NULL;
+
+/* ---------- /health ---------- */
+
+/* GET /health — diagnostics JSON.
+ *
+ * Returns 200 with a JSON body describing the device's network and
+ * memory health. Never returns 500 — if WiFi is down the endpoint
+ * still answers with RSSI -1 and IP 0.0.0.0 so an off-network or
+ * wedged device can still be diagnosed.
+ *
+ * Fields:
+ *   uptime_ms        — milliseconds since boot (monotonic)
+ *   free_heap        — bytes of free internal RAM right now
+ *   min_free_heap    — lowest-ever free internal RAM since boot
+ *   free_psram       — bytes of free PSRAM (0 if not present)
+ *   ip               — current IPv4 address, "0.0.0.0" if not connected
+ *   rssi             — current WiFi RSSI in dBm, -1 if not connected
+ *   reconnect_count  — number of esp_wifi_connect() calls issued
+ *                      by the reconnect task since boot
+ *   last_disconn_rc  — wifi_event_sta_disconnected_t.reason from
+ *                      the most recent disconnect, 0 if none
+ *   ws_viewer        — 1 if a WS viewer is currently attached, 0 otherwise
+ *
+ * The off-network / wedged / healthy discriminator:
+ *   off-network — ip == "0.0.0.0", rssi == -1
+ *   wedged     — ip != "0.0.0.0", heap collapsing
+ *   healthy    — ip present, RSSI reasonable, reconnect_count stable
+ */
+static esp_err_t health_get_handler(httpd_req_t *req)
+{
+    if (!req) return ESP_FAIL;
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    /* Uptime: use xTaskGetTickCount() × portTICK_PERIOD_MS.
+     * Both are always available without any new includes.
+     * xTaskGetTickCount is safe to call from an ISR or task. */
+    uint32_t uptime_ms = (uint32_t)(
+        (uint64_t)xTaskGetTickCount() * (uint64_t)portTICK_PERIOD_MS);
+
+    uint32_t free_heap     = esp_get_free_heap_size();
+    uint32_t min_free_heap = esp_get_minimum_free_heap_size();
+    uint32_t free_psram    = 0;
+#if CONFIG_ESP32_SPIRAM_SUPPORT || CONFIG_ESP_SPIRAM
+    free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+#endif
+
+    /* IP address from the station netif. Graceful fallback if
+     * the station is not connected: report 0.0.0.0 rather than
+     * returning 500 — /health must still answer when the device
+     * is off-network. */
+    char ip_str[16] = "0.0.0.0";
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta_netif) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
+            snprintf(ip_str, sizeof(ip_str), IPSTR,
+                     IP2STR(&ip_info.ip));
+        }
+    }
+
+    /* RSSI from the AP record. Graceful fallback: report -1 when
+     * the station is not connected (esp_wifi_sta_get_ap_info returns
+     * ESP_ERR_WIFI_NOT_CONNECT). */
+    int rssi = -1;
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        rssi = (int)ap_info.rssi;
+    }
+
+    uint32_t reconn    = provisioning_reconnect_count();
+    uint8_t  disconn  = provisioning_last_disconnect_reason();
+    int      ws_fd     = ws_cams_viewer_fd_get();
+    int      ws_viewer = (ws_fd >= 0) ? 1 : 0;
+
+    char buf[256];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"uptime_ms\":%lu,\"free_heap\":%lu,\"min_free_heap\":%lu,"
+        "\"free_psram\":%lu,\"ip\":\"%s\",\"rssi\":%d,"
+        "\"reconnect_count\":%lu,\"last_disconn_rc\":%u,\"ws_viewer\":%d}",
+        (unsigned long)uptime_ms,
+        (unsigned long)free_heap,
+        (unsigned long)min_free_heap,
+        (unsigned long)free_psram,
+        ip_str,
+        rssi,
+        (unsigned long)reconn,
+        (unsigned)disconn,
+        ws_viewer);
+
+    if (len < 0 || (size_t)len >= sizeof(buf)) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "{\"error\":\"buf_overflow\"}");
+        return ESP_OK;
+    }
+
+    httpd_resp_send(req, buf, len);
+    return ESP_OK;
+}
 
 /* ---------- /whoami ---------- */
 
@@ -118,25 +230,66 @@ static esp_err_t whoami_get_handler(httpd_req_t *req)
         default: chip_str = "ESP32-UNKNOWN"; break;
     }
 
-    /* Device name from Kconfig. */
+    /* Device name and firmware version from provisioning. */
     extern const char *prov_device_name(void);
     const char *name = prov_device_name();
     const char *description = "";  /* no identity NVS yet */
+    const char *fw_ver = prov_fw_version();
+
+    /* Uptime in seconds (monotonic, integer). */
+    uint32_t uptime_s = ((uint32_t)xTaskGetTickCount() * (uint32_t)portTICK_PERIOD_MS) / 1000U;
+
+    /* Live IP and RSSI. Graceful fallback: "0.0.0.0" and -1 when
+     * the station is not connected. */
+    char ip_str[16] = "0.0.0.0";
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta_netif) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
+            snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+        }
+    }
+
+    int rssi = -1;
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        rssi = (int)ap_info.rssi;
+    }
 
     /* Build JSON response using static buffer (no heap allocation).
-     * Format: {"mac":"...","name":"...","fw":"...","chip":"..."}
-     * description is omitted when empty (saves 14 bytes). */
-    char buf[160];
+     * Format: {"mac":"...","name":"...","fw":"...","chip":"...",
+     *          "idf":"...","ip":"...","rssi":N,"uptime_s":N}
+     *
+     * fw: application firmware version (e.g. "0.1.0"), NOT esp_get_idf_version().
+     *     The backend uses fw to identify which deployed image is running;
+     *     esp_get_idf_version() (e.g. "v5.5.3") is meaningless for that purpose.
+     *
+     * idf: ESP-IDF version string. Additive field — Go's encoding/json
+     *      ignores unknown fields, so this is safe for existing backends.
+     *
+     * ip, rssi, uptime_s: live state. Fallback values when the station
+     *     is not connected (off-network / wedged) so the endpoint still
+     *     answers 200 instead of 500. */
+    char buf[256];
     int len;
     if (description[0] == '\0') {
-        /* Omit description when empty. */
         len = snprintf(buf, sizeof(buf),
-            "{\"mac\":\"%s\",\"name\":\"%s\",\"fw\":\"%s\",\"chip\":\"%s\"}",
-            mac_hex, name, esp_get_idf_version(), chip_str);
+            "{\"mac\":\"%s\",\"name\":\"%s\",\"fw\":\"%s\",\"chip\":\"%s\","
+            "\"idf\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"uptime_s\":%u}",
+            mac_hex, name,
+            fw_ver[0] ? fw_ver : "unknown",
+            chip_str,
+            esp_get_idf_version(),
+            ip_str, rssi, (unsigned)uptime_s);
     } else {
         len = snprintf(buf, sizeof(buf),
-            "{\"mac\":\"%s\",\"name\":\"%s\",\"description\":\"%s\",\"fw\":\"%s\",\"chip\":\"%s\"}",
-            mac_hex, name, description, esp_get_idf_version(), chip_str);
+            "{\"mac\":\"%s\",\"name\":\"%s\",\"description\":\"%s\",\"fw\":\"%s\",\"chip\":\"%s\","
+            "\"idf\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"uptime_s\":%u}",
+            mac_hex, name, description,
+            fw_ver[0] ? fw_ver : "unknown",
+            chip_str,
+            esp_get_idf_version(),
+            ip_str, rssi, (unsigned)uptime_s);
     }
 
     if (len < 0 || (size_t)len >= sizeof(buf)) {
@@ -326,6 +479,23 @@ esp_err_t sta_server_start(void)
     err = httpd_register_uri_handler(s_sta_httpd, &capture_uri);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "register /capture failed: %s", esp_err_to_name(err));
+        httpd_stop(s_sta_httpd);
+        s_sta_httpd = NULL;
+        return err;
+    }
+
+    /* Register /health — diagnostics endpoint for network and memory
+     * observability. Same handle, same audience (post-provisioning
+     * LAN clients and the Pi monitoring agent). */
+    httpd_uri_t health_uri = {
+        .uri       = "/health",
+        .method    = HTTP_GET,
+        .handler   = health_get_handler,
+        .user_ctx  = NULL,
+    };
+    err = httpd_register_uri_handler(s_sta_httpd, &health_uri);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "register /health failed: %s", esp_err_to_name(err));
         httpd_stop(s_sta_httpd);
         s_sta_httpd = NULL;
         return err;
