@@ -265,6 +265,32 @@ esp_err_t sta_server_start(void)
     cfg.max_uri_handlers = 8;
     cfg.max_req_hdr_len = 512;
 
+    /* Defect B fix, part 1 — size the socket pool.
+     * Three /ws/cams viewers (one per camera, single-viewer
+     * enforcement exists) hold 3 sockets permanently. A CCTV
+     * grid with all three cameras open holds 3 WS + 3 capture
+     * sessions + discovery polling + slack. HTTPD_DEFAULT_CONFIG
+     * leaves max_open_sockets=7 with lru_purge_enable=false,
+     * so the pool never self-reclaims and new connections
+     * stall in backlog_conn=5. */
+    cfg.max_open_sockets = 12;
+    cfg.lru_purge_enable = true;
+
+    /* Defect B fix, part 2 — bound how long a half-dead client
+     * pins a thread + socket. Request parsing needs no longer
+     * than 3 s. send_wait_timeout stays at the 5 s default —
+     * a ~30 KB JPEG on a weak link genuinely needs it. */
+    cfg.recv_wait_timeout = 3;
+
+    /* Defect B fix, part 3 — raise httpd worker priority above
+     * the camera stream producer. Priority invariant:
+     * esp_event (20) > httpd (5) > cam_stream (3).
+     * The old priority (tskIDLE_PRIORITY+5 = 1) let the
+     * cam_stream producer at priority 5 starve the httpd
+     * workers that all discovery, surveillance, and the UI
+     * depend on. */
+    cfg.task_priority = 5;
+
     esp_err_t err = httpd_start(&s_sta_httpd, &cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(err));

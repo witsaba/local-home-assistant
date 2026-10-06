@@ -258,13 +258,14 @@ esp_err_t cam_stream_task_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Same task-priority convention as cam_reader's captures
-     * run on; 4 KiB stack — the stream task consumes JPEGs
-     * (no init / no large allocation). If min-stack tightens
-     * past 1 KB free at runtime, raise this constant. */
+    /* Priority invariant: wifi_task (23) > esp_event (20) >
+     * httpd (5) > cam_stream (3). The producer must never
+     * outrank the HTTP server that the UI and all discovery
+     * depend on. The old priority of 5 let cam_stream starve
+     * httpd workers under load (Defect B fix). */
     enum {
         CAM_STREAM_TASK_STACK = 4096,
-        CAM_STREAM_TASK_PRIO  = 5,
+        CAM_STREAM_TASK_PRIO  = 3,
     };
     BaseType_t ok = xTaskCreate(
         cam_stream_task_entry, "cam_stream",
