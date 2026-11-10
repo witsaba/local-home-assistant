@@ -189,3 +189,21 @@ together in one branch and one image, not as two PRs requiring two flash rounds.
 | `319ee3d` | operator documentation (T7) | ~150 |
 
 The pre-existing liveness commits (`7a4bab0` … `e0e4147`) are that feature's own work units and are unchanged by this work. A reviewer should read the two features as two slices of the branch, not one 2 000-line diff.
+
+**L16** (agent, verification record). The independent verifier (`gentle-ai-verify`) was **unavailable** — the subagent service returned a quota error for both the writer and the verifier, and no retry was made. The checks it would have run were therefore performed inline, against the same list:
+
+1. *The reconnect task's retry has no attempt ceiling* — HOLDS. `sta_reconnect_task` (`provisioning.c`) is unmodified by this feature; its inner loop is `while (s_sta_disconnected_pending)` with a backoff capped at 30 s and no counter. No retry limit was introduced anywhere.
+2. *`router_absent` can never reach the reboot* — HOLDS. `classify_outage()` returns `PROV_OUTAGE_ROUTER_ABSENT` for reason 0 and `WIFI_REASON_NO_AP_FOUND`; `provisioning_supervise_sta()` returns `ESP_OK` for that class **before** the step-2 block and before the step-3 reboot block, and `request_reboot()` is called from exactly one place.
+3. *The reboot is gated by both the dwell and the backoff* — HOLDS. The step-3 condition is `s_outage_elapsed_ms >= REBOOT_AFTER_MS && (now - s_boot_started_ms) >= backoff`, and `backoff` comes from the persisted `selfrec` counter.
+4. *The liveness signals cannot produce a reboot loop* — HOLDS. `camera_path_stuck()` reports "stuck" only when neither the captured-frame nor the dropped-frame counter moved; a dead sensor keeps raising the drop counter, so it is reported and never rebooted.
+5. *The self-probe cannot deadlock* — HOLDS, with one caveat. It runs only from the supervisor task, never from an httpd handler; the socket carries `SO_RCVTIMEO`/`SO_SNDTIMEO`; and `close(fd)` sits on the single exit path, after the `if` blocks, so every path after a successful `socket()` closes it. Caveat: lwIP's `connect()` is not bounded by those timeouts, so a fully wedged listener can stall the supervisor for lwIP's own TCP retransmit window (seconds). The 30 s supervisor tick absorbs it.
+6. *The NVS change cannot leave the device inert* — HOLDS. `provisioning_init()` no longer returns on an NVS error: it erases, re-initialises, logs, and continues. `wifi_cred_is_saved()` returns false when `nvs_open` fails, so the device takes the SoftAP path.
+7. *Shared statics* — one issue found and fixed: `s_outage_elapsed_ms` and `s_self_probe_ok` are written by the supervisor task and read by the httpd worker through the accessors, and were not `volatile`. Both are now `volatile`.
+8. *No blocking call inside an `esp_event` handler* — HOLDS. The new code adds no handler; the only `vTaskDelay` calls are in the supervisor task and in the pre-existing reconnect task.
+9. *No new binary semaphore* — HOLDS. The change adds no semaphore. The pre-existing binary semaphore in `cam_reader.c` is untouched and remains a known wart.
+10. *Tick-counter wrap (~49 days)* — HOLDS. Every duration comparison is an unsigned subtraction between two `uint32_t` tick values (`now - x`), which is wrap-safe. No signed or mixed-width comparison was introduced.
+11. *No wall-clock time source* — HOLDS. The only time base is `xTaskGetTickCount()`; no SNTP, no RTC, no `time()`.
+
+Clean build re-verified after the `volatile` fix: exit 0, **zero warnings**, `iot_cams.bin` 0x102a70 bytes, 33 % free.
+
+**Still unverified without hardware**: the classification in the field, the self-probe against a live httpd, the reboot itself, and the backoff surviving a real power cut. Operator-gated — one serial flash for all three devices.
