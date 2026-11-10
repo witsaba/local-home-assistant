@@ -207,3 +207,25 @@ The pre-existing liveness commits (`7a4bab0` … `e0e4147`) are that feature's o
 Clean build re-verified after the `volatile` fix: exit 0, **zero warnings**, `iot_cams.bin` 0x102a70 bytes, 33 % free.
 
 **Still unverified without hardware**: the classification in the field, the self-probe against a live httpd, the reboot itself, and the backoff surviving a real power cut. Operator-gated — one serial flash for all three devices.
+
+**L17** (agent, HARDWARE verification — device `d4:e9:f4:8d:38:1c`, IP 192.168.1.199, ESP32-D0WD-V3 rev v3.1). Two flashes were needed, and the first one found a defect that only real hardware could find.
+
+**Defect found and fixed — PR #40's socket-pool change never worked.** The first flash of this branch booted, joined the AP and reported a perfectly healthy WiFi link — but the HTTP server never started:
+
+```
+E (3742) httpd: Config option max_open_sockets is too large (max allowed 7, 3 sockets used by HTTP server internally)
+E (3762) sta_srv: httpd_start failed: ESP_ERR_INVALID_ARG
+E (3762) app_main: failed to start STA server: ESP_ERR_INVALID_ARG
+```
+
+Root cause: IDF requires `LWIP_MAX_SOCKETS >= max_open_sockets + 3` (`esp_http_server/src/httpd_main.c:495`), because the httpd reserves 3 sockets for itself. The lwIP default is `CONFIG_LWIP_MAX_SOCKETS = 10`, which caps the httpd at 7 sockets. PR #40 set `max_open_sockets = 12` but never raised the lwIP limit, and IDF does NOT clamp the request down — **`httpd_start()` fails outright**, so the device comes up with no HTTP server at all. Every endpoint (`/whoami`, `/capture`, `/health`) is unreachable while the WiFi looks perfectly healthy. That is the exact "alive but not responding over the network" symptom, produced by the fix for it. Fix: `CONFIG_LWIP_MAX_SOCKETS=16` in `sdkconfig.defaults` (12 httpd sockets + 3 reserved + 1 spare), with the reasoning recorded in the file. PR #40 had never been flashed, which is why this survived a green `idf.py build` and a code review.
+
+**Post-fix hardware results (second flash, "Hash of data verified"):**
+- Boot: `prov: init: reset reason = 1` (`ESP_RST_SW`, our own post-flash reset), `sta_srv: STA server running on port 80 (/whoami, /capture, /ws/cams registered; wifi lifecycle subscribers live)`, `wifi:pm start, type: 0` (`WIFI_PS_NONE` — PR #40's power-save fix confirmed live).
+- `GET /health` → `{"outage":"none","outage_ms":0,"unhealthy_boots":0,"backoff_ms":900000,"self_probe_ok":1,"frames_captured":425,"frames_dropped":0,"reset_reason":1,"reboot_reason":0,"free_heap":4119116,"free_psram":3998528,...}` — **the loopback self-probe answered (`self_probe_ok: 1`), the camera counter is climbing (425 frames), and the backoff is at its 15-minute base.** `CONFIG_LWIP_MAX_SOCKETS=16` cost no measurable heap: free heap is 4.1 MB (PSRAM-inclusive) and free PSRAM 3.99 MB.
+- `GET /whoami` → `{"mac":"d4e9f48d381c","name":"iot-cam","fw":"0.1.0","chip":"ESP32-D0WDQ6","idf":"v5.5.3","ip":"192.168.1.199","rssi":-36,"uptime_s":42}` — PR #40's corrected identity, live.
+- `GET /capture` → HTTP 200, 22 795 bytes, `image/jpeg`, a valid 800×600 baseline JFIF. `GET /capture?flash=1` → HTTP 200, 23 071 bytes, header `X-Witsaba-Flash: 1`.
+
+**Still unverified on hardware**: the outage classification in the field, the step-2 re-associate, the step-3 reboot, and the backoff surviving a real power cut. Those need the router to be taken down deliberately.
+
+**L18** (agent, toolchain trap). The IDF build prints its own flash command with `build/partition-table/partition-table.bin` — a HYPHEN. The real file is `build/partition_table/partition-table.bin`, with an UNDERSCORE. Copying the printed command verbatim fails at argument parsing, before esptool opens the port, so **nothing is written and the device silently keeps running its old firmware** — the boot log then looks plausible and only the absence of the new markers reveals it. Always confirm the artifact path exists before flashing.
