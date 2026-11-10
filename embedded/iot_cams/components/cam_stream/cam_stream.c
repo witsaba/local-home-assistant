@@ -38,6 +38,7 @@
 
 #include "esp_camera.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 #include "cam_reader.h"
 #include "cam_stream.h"
@@ -99,6 +100,21 @@ static const cam_stream_sink_t s_sink_disconnected = {
  * handshake accept in W5). */
 static const cam_stream_sink_t *s_sink = &s_sink_disconnected;
 
+/* The stream task's own copy of the current frame.
+ *
+ * The camera must NEVER be held across a socket write. The sink's
+ * send is a blocking lwIP write bounded by the httpd's
+ * `send_wait_timeout` (5 s by default): a viewer that stops reading
+ * would otherwise hold the sensor for the whole timeout and starve
+ * every other consumer of it — the /capture request would time out
+ * and return 503 while the stream hogged the camera.
+ *
+ * So the frame is copied out of the camera's buffer, the camera is
+ * released, and only then is the copy written to the socket. The
+ * buffer is owned exclusively by the stream task, so it needs no
+ * lock: the only writer and the only reader are the same task. */
+static uint8_t *s_frame_buf = NULL;
+
 /* ---------- sink seam accessors (cross-TU share) ---------- */
 
 void cam_stream_sink_install(const cam_stream_sink_t *sink)
@@ -156,31 +172,30 @@ uint32_t cam_stream_frames_dropped_get(void)
  */
 bool cam_stream_loop_iteration(void)
 {
-    camera_fb_t *fb = NULL;
-    esp_err_t r = cam_reader_capture(&fb);
+    /* Copy the frame out and release the camera BEFORE the socket
+     * write. On ESP_ERR_TIMEOUT the camera was never taken; on
+     * ESP_FAIL the camera has already been released by the reader. */
+    size_t len = 0;
+    esp_err_t r = cam_reader_capture_copy(s_frame_buf,
+                                          CAM_READER_JPEG_BUFFER_SIZE,
+                                          &len, false);
 
     if (r == ESP_ERR_TIMEOUT || r == ESP_ERR_INVALID_STATE ||
         r == ESP_ERR_INVALID_ARG) {
-        /* No release needed; the mutex was never taken
-         * (timeout) or the caller's invariants broke
-         * (invalid_arg / invalid_state). Stay idle and try
-         * again next tick. */
+        /* No frame. Stay idle and try again next tick. The camera
+         * was never taken on these paths, so nothing is released. */
         return false;
     }
-    if (r == ESP_FAIL) {
-        /* Mutex acquired, fb_get failed. MUST release(NULL)
-         * to drop the mutex per cam_reader.h. */
-        cam_reader_release(NULL);
+    if (r != ESP_OK) {
+        /* The camera has already been released by the reader. */
         s_frames_dropped++;
         return false;
     }
 
-    /* r == ESP_OK, fb is non-NULL. Send then release. */
-    esp_err_t send_r = cam_stream_sink_send_bin(fb->buf, fb->len);
-
-    /* cam_reader_release is safe even on send failure — we
-     * owned the buffer from cam_reader_capture onwards. */
-    cam_reader_release(fb);
+    /* The camera is free. The socket write below may block for as
+     * long as the viewer takes, and that is now nobody's problem
+     * but the stream's. */
+    esp_err_t send_r = cam_stream_sink_send_bin(s_frame_buf, len);
 
     if (send_r != ESP_OK) {
         s_frames_dropped++;
@@ -236,6 +251,27 @@ esp_err_t cam_stream_init(void)
      * cam_stream_sink_send_bin can route every send through
      * s_sink without a NULL check. */
     cam_stream_sink_install(NULL);
+
+    /* The stream task's frame buffer. Sized to match the camera's
+     * own JPEG buffer so a frame can never be larger than the
+     * buffer it is copied into. PSRAM first, internal DRAM as a
+     * fallback for a build without PSRAM. */
+    if (s_frame_buf == NULL) {
+        s_frame_buf = heap_caps_malloc(CAM_READER_JPEG_BUFFER_SIZE,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_frame_buf == NULL) {
+            s_frame_buf = heap_caps_malloc(CAM_READER_JPEG_BUFFER_SIZE,
+                                           MALLOC_CAP_8BIT);
+        }
+        if (s_frame_buf == NULL) {
+            ESP_LOGE(TAG, "init: no memory for the frame buffer "
+                          "(%d bytes) — the stream is unavailable",
+                     (int)CAM_READER_JPEG_BUFFER_SIZE);
+            return ESP_ERR_NO_MEM;
+        }
+        ESP_LOGI(TAG, "init: frame buffer allocated (%d bytes)",
+                 (int)CAM_READER_JPEG_BUFFER_SIZE);
+    }
 
     s_init_done = true;
     ESP_LOGI(TAG,

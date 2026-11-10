@@ -52,6 +52,9 @@
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "cam_reader.h"
 #include "ws_cams.h"
 
@@ -67,6 +70,21 @@ static const char *TAG = "sta_srv";
 
 /* The httpd handle. NULL when not running. */
 static httpd_handle_t s_sta_httpd = NULL;
+
+/* The /capture response buffer.
+ *
+ * The frame is copied out of the camera and the CAMERA IS RELEASED
+ * before the socket write, so a slow client can never hold the
+ * sensor. Holding it across the write was the original defect: the
+ * write is bounded by the httpd's `send_wait_timeout` (5 s), and a
+ * stalled client held the camera for the whole of it.
+ *
+ * The buffer is shared between concurrent /capture requests and is
+ * protected by a real MUTEX — a binary semaphore has no FreeRTOS
+ * priority inheritance, which is the same wart that made the
+ * original starvation invisible. */
+static uint8_t *s_capture_buf = NULL;
+static SemaphoreHandle_t s_capture_buf_mtx = NULL;
 
 /* ---------- /health ---------- */
 
@@ -387,21 +405,39 @@ static esp_err_t capture_get_handler(httpd_req_t *req)
         }
     }
 
-    camera_fb_t *fb = NULL;
-    esp_err_t r = cam_reader_capture_with_flash(&fb, flash);
-
-    if (r == ESP_ERR_TIMEOUT) {
-        ESP_LOGW(TAG, "capture: mutex timeout; another caller busy");
+    /* One capture at a time. The mutex protects the shared response
+     * buffer, NOT the camera: the camera is released inside
+     * cam_reader_capture_copy, before the socket write below. */
+    if (s_capture_buf == NULL || s_capture_buf_mtx == NULL) {
+        ESP_LOGE(TAG, "capture: no response buffer");
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "text/plain");
         httpd_resp_sendstr(req, "Camera busy, please try again");
         return ESP_OK;
     }
-    if (r != ESP_OK || fb == NULL) {
-        ESP_LOGE(TAG, "capture: sensor returned no frame (flash=%d)",
-                 (int)flash);
+
+    xSemaphoreTake(s_capture_buf_mtx, portMAX_DELAY);
+
+    /* Copy the frame out; the camera is released before this
+     * returns, so the socket write below blocks nobody else. */
+    size_t len = 0;
+    esp_err_t r = cam_reader_capture_copy(s_capture_buf,
+                                          CAM_READER_JPEG_BUFFER_SIZE,
+                                          &len, flash);
+
+    if (r == ESP_ERR_TIMEOUT) {
+        xSemaphoreGive(s_capture_buf_mtx);
+        ESP_LOGW(TAG, "capture: camera busy; another caller holds it");
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, "Camera busy, please try again");
+        return ESP_OK;
+    }
+    if (r != ESP_OK) {
+        xSemaphoreGive(s_capture_buf_mtx);
+        ESP_LOGE(TAG, "capture: sensor returned no frame (flash=%d): %s",
+                 (int)flash, esp_err_to_name(r));
         httpd_resp_send_500(req);
-        cam_reader_release(NULL);  /* drop the mutex */
         return ESP_FAIL;
     }
 
@@ -417,8 +453,11 @@ static esp_err_t capture_get_handler(httpd_req_t *req)
         httpd_resp_set_hdr(req, "X-Witsaba-Flash", "1");
     }
 
-    esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-    cam_reader_release(fb);
+    /* The camera has been released. This write may block for as long
+     * as the client takes, and it now blocks nobody else. */
+    esp_err_t res = httpd_resp_send(req, (const char *)s_capture_buf, len);
+
+    xSemaphoreGive(s_capture_buf_mtx);
 
     if (res == ESP_OK) {
         ESP_LOGD(TAG, "capture: served frame flash=%d", (int)flash);
@@ -435,6 +474,31 @@ esp_err_t sta_server_start(void)
     if (s_sta_httpd) {
         ESP_LOGW(TAG, "sta_server already running");
         return ESP_OK;
+    }
+
+    /* The /capture response buffer. Sized to match the camera's own
+     * JPEG buffer so a frame can never be larger than the buffer it
+     * is copied into. PSRAM first, internal DRAM as a fallback. */
+    if (s_capture_buf == NULL) {
+        s_capture_buf = heap_caps_malloc(CAM_READER_JPEG_BUFFER_SIZE,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_capture_buf == NULL) {
+            s_capture_buf = heap_caps_malloc(CAM_READER_JPEG_BUFFER_SIZE,
+                                             MALLOC_CAP_8BIT);
+        }
+        if (s_capture_buf == NULL) {
+            /* Not fatal: /whoami, /health and /ws/cams still work;
+             * only /capture is unavailable. */
+            ESP_LOGE(TAG, "sta_server_start: no memory for the capture "
+                          "buffer (%d bytes) — /capture is unavailable",
+                     (int)CAM_READER_JPEG_BUFFER_SIZE);
+        }
+    }
+    if (s_capture_buf_mtx == NULL) {
+        s_capture_buf_mtx = xSemaphoreCreateMutex();
+        if (s_capture_buf_mtx == NULL) {
+            ESP_LOGE(TAG, "sta_server_start: xSemaphoreCreateMutex failed");
+        }
     }
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -571,6 +635,15 @@ void sta_server_stop(void)
     }
     s_sta_httpd = NULL;
     ESP_LOGI(TAG, "STA server stopped");
+
+    if (s_capture_buf != NULL) {
+        free(s_capture_buf);
+        s_capture_buf = NULL;
+    }
+    if (s_capture_buf_mtx != NULL) {
+        vSemaphoreDelete(s_capture_buf_mtx);
+        s_capture_buf_mtx = NULL;
+    }
 }
 
 bool sta_server_is_running(void)
