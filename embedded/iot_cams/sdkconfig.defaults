@@ -81,6 +81,32 @@ CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_SPEED_40M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 
+# === HTTP server: socket pool ===
+#
+# The STA httpd is configured with max_open_sockets = 12 (see
+# components/provisioning/src/sta_server.c) so that permanent
+# /ws/cams viewers, the surveillance worker's /capture requests and
+# the self-recovery loopback /health probe cannot exhaust the pool.
+#
+# IDF REQUIRES lwIP to have at least max_open_sockets + 3 sockets:
+# the httpd reserves 3 for its own use (the listening socket and
+# two UDP control sockets). See esp_http_server/src/httpd_main.c:
+#
+#     if (HTTPD_MAX_SOCKETS < config->max_open_sockets + 3) { ... }
+#
+# The lwIP default is CONFIG_LWIP_MAX_SOCKETS = 10, which caps the
+# httpd at 7 sockets — and requesting 12 against it does NOT clamp
+# down, it makes httpd_start() FAIL with ESP_ERR_INVALID_ARG, so the
+# device comes up with no HTTP server at all and every endpoint
+# (/whoami, /capture, /health) is unreachable while the WiFi looks
+# perfectly healthy. This was caught on real hardware.
+#
+# 16 = 12 httpd sockets + 3 reserved + 1 spare. The extra sockets
+# cost lwIP pcb memory only when a connection is actually active,
+# so the idle footprint stays small; the free heap is reported on
+# /health so the real cost is observable rather than assumed.
+CONFIG_LWIP_MAX_SOCKETS=16
+
 # === HTTP server: WebSocket support ===
 #
 # Required by the /ws/cams endpoint (W4 of
