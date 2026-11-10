@@ -199,6 +199,62 @@ uint32_t provisioning_reconnect_count(void);
  * Safe to call from any task; reads are atomic. */
 uint8_t provisioning_last_disconnect_reason(void);
 
+/* ---------- self-recovery surface ----------
+ * See odd/tasks/camera-self-recovery.md. The device must recover
+ * from a power cut on its own, and the response is INCREMENTAL:
+ * cheapest action first, and a reboot only when the cheaper steps
+ * are exhausted AND the fault is provably on our side of the wire. */
+
+/* Classification of the current outage. Drives the escalation
+ * ladder. PROV_OUTAGE_ROUTER_ABSENT is the class that must NEVER
+ * reach the reboot step: a reboot cannot conjure a router, and
+ * rebooting while the router is still coming up turns a long power
+ * event into a reboot storm. */
+typedef enum {
+    PROV_OUTAGE_NONE          = 0, /* healthy */
+    PROV_OUTAGE_ROUTER_ABSENT = 1, /* the home AP was not found in the scan */
+    PROV_OUTAGE_LINK_FAILED   = 2, /* the AP was found, the link failed */
+    PROV_OUTAGE_WEDGED        = 3, /* we hold an IP but the device is not serving */
+} prov_outage_class_t;
+
+/* Current outage class. Never PROV_OUTAGE_NONE while the device is
+ * failing. Safe to call from any task. */
+prov_outage_class_t provisioning_outage_class(void);
+
+/* Human-readable name of an outage class, for logs and /health.
+ * Never NULL. */
+const char *provisioning_outage_class_name(prov_outage_class_t cls);
+
+/* How long the current outage has lasted, in milliseconds. Zero
+ * when there is no outage. */
+uint32_t provisioning_outage_elapsed_ms(void);
+
+/* Number of consecutive unhealthy boots. Zero after the device has
+ * proved healthy again. Persisted in NVS. */
+uint32_t provisioning_boot_count(void);
+
+/* The wait enforced before the next unhealthy reboot, in
+ * milliseconds. Doubles per consecutive unhealthy boot, capped at
+ * four hours. This is the reboot-storm guard. */
+uint32_t provisioning_reboot_backoff_ms(void);
+
+/* esp_reset_reason() captured at boot. Distinguishes a
+ * self-inflicted software reset from a power-loss reset. */
+uint8_t provisioning_last_reset_reason(void);
+
+/* The reason code recorded before the last requested reboot. */
+uint8_t provisioning_reboot_reason(void);
+
+/* True when the last HTTP self-probe succeeded. A false value with
+ * an IP present is what classifies the device as WEDGED. */
+bool provisioning_self_probe_ok(void);
+
+/* Camera frame counters, mirrored for the /health endpoint and for
+ * the liveness signal. frames_dropped rising while frames_captured
+ * is flat means the camera itself is failing. */
+uint32_t provisioning_frames_captured(void);
+uint32_t provisioning_frames_dropped(void);
+
 /* Application firmware version recorded at provisioning_init()
  * from provisioning_app_info_t.fw_version. Never NULL.
  * Mirrors the existing prov_device_name() seam. */

@@ -42,9 +42,15 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
+#include "provisioning.h"
 #include "captive_portal.h"
 #include "sta_server.h"
 #include "wifi_cred.h"
+#include "cam_reader.h"
+
+#include "nvs.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
 
 /* Needed for heap_caps_get_free_size(MALLOC_CAP_SPIRAM) in the
  * periodic heartbeat. The heap component is a fundamental ESP-IDF
@@ -88,6 +94,349 @@ static volatile uint32_t s_no_ip_ticks = 0;
 /* Handle for the station-reconnect task created by ensure_sta_event_handlers.
  * Valid only after the handlers have been registered at least once. */
 static TaskHandle_t s_reconnect_task_handle = NULL;
+
+/* ---------- self-recovery ----------
+ *
+ * The device must survive a power cut on its own: after a power cut
+ * the chip may boot and run while the router is still off, so the
+ * response has to be INCREMENTAL — cheapest action first, and a
+ * reboot only when the cheaper steps are exhausted AND the fault is
+ * provably on our side of the wire.
+ *
+ * The escalation ladder:
+ *
+ *   step 1  reconnect     owned by sta_reconnect_task (existing)
+ *   step 2  re-associate  esp_wifi_disconnect() + esp_wifi_connect()
+ *   step 3  reboot        esp_restart()
+ *
+ * The ladder is NOT entered for the ROUTER_ABSENT class. A reboot
+ * cannot conjure a router, and rebooting while the router is still
+ * coming up would turn a long power event into a reboot storm —
+ * indistinguishable from the fault we are trying to fix. In that
+ * class the device simply keeps retrying, which is exactly what
+ * the reconnect task already does, forever, with no attempt ceiling.
+ *
+ * Every duration below is derived from the supervisor tick or from
+ * uptime. The firmware has no wall-clock time source (no SNTP, no
+ * RTC), so nothing here may depend on one. */
+
+/* NVS namespace for the self-recovery state. Kept separate from
+ * "wifi_cred" and from the driver's "nvs.net80211" so the reboot
+ * bookkeeping can never disturb the credentials. */
+#define SELFREC_NS              "selfrec"
+#define SELFREC_KEY_BOOT_COUNT  "boot_count"
+#define SELFREC_KEY_REBOOT_PEND "reboot_pending"
+#define SELFREC_KEY_REBOOT_RSN  "reboot_reason"
+
+/* Reason codes recorded before a requested reboot. */
+#define REBOOT_RSN_LINK_FAILED 1
+#define REBOOT_RSN_WEDGED      2
+
+/* Dwell before the re-associate step (step 2). */
+#define REASSOCIATE_AFTER_MS    (2U * 60U * 1000U)
+/* Dwell before the reboot step (step 3) may fire. */
+#define REBOOT_AFTER_MS         (15U * 60U * 1000U)
+/* Wait enforced before the FIRST unhealthy reboot. Doubles per
+ * consecutive unhealthy boot and is capped: this is the
+ * reboot-storm guard. */
+#define REBOOT_BACKOFF_BASE_MS  (15U * 60U * 1000U)
+#define REBOOT_BACKOFF_MAX_MS   (4U * 60U * 60U * 1000U)
+/* A liveness signal that has not moved for this long is stale. */
+#define LIVENESS_STALE_MS       (10U * 60U * 1000U)
+/* How often the HTTP self-probe runs. */
+#define SELF_PROBE_INTERVAL_MS  (2U * 60U * 1000U)
+#define SELF_PROBE_TIMEOUT_MS   3000U
+/* Consecutive probe failures before the server counts as wedged. */
+#define SELF_PROBE_FAIL_LIMIT   3U
+/* Healthy for this long -> forget the previous unhealthy boots. */
+#define HEALTHY_RESET_AFTER_MS  (10U * 60U * 1000U)
+
+/* Boot bookkeeping and the reboot-storm guard. */
+static volatile uint32_t s_boot_count        = 0;
+static volatile bool     s_reboot_pending    = false;
+static volatile uint8_t  s_reboot_reason     = 0;
+static volatile uint8_t  s_last_reset_reason = 0;
+
+/* Current outage classification and its age. */
+static volatile uint8_t s_outage_class     = PROV_OUTAGE_NONE;
+static bool     s_outage_active   = false;
+static uint32_t s_outage_started_ms = 0;
+static uint32_t s_outage_elapsed_ms = 0;
+
+/* Uptime at boot. The reboot backoff is measured from here, so a
+ * device that rebooted recently cannot immediately reboot again. */
+static uint32_t s_boot_started_ms = 0;
+
+/* Liveness signals. */
+static uint32_t s_last_frame_count   = 0;
+static uint32_t s_last_frame_seen_ms = 0;
+static uint32_t s_fb_drops_seen      = 0;
+static bool     s_self_probe_ok      = true;
+static bool     s_probe_started      = false;
+static uint32_t s_probe_fail_streak  = 0;
+static uint32_t s_probe_last_ms      = 0;
+
+/* Healthy tracking and the escalation step. */
+static uint32_t s_healthy_since_ms   = 0;
+static bool     s_healthy_tracking   = false;
+static bool     s_healthy_reset_done = false;
+static bool     s_escalated_reassoc  = false;
+
+/* Milliseconds since boot. Derived from the FreeRTOS tick counter,
+ * which wraps after ~49 days; all arithmetic below is unsigned so
+ * the wrap is handled correctly. */
+static uint32_t now_ms(void)
+{
+    return (uint32_t)((uint64_t)xTaskGetTickCount() *
+                      (uint64_t)portTICK_PERIOD_MS);
+}
+
+/* Persist the self-recovery bookkeeping. Failure is logged, not
+ * fatal: the worst case is a reboot-storm guard that does not
+ * survive a power cut. */
+static esp_err_t selfrec_save(void)
+{
+    nvs_handle_t h;
+    esp_err_t r = nvs_open(SELFREC_NS, NVS_READWRITE, &h);
+    if (r != ESP_OK) {
+        ESP_LOGW(TAG, "selfrec: nvs_open: %s", esp_err_to_name(r));
+        return r;
+    }
+    (void)nvs_set_u32(h, SELFREC_KEY_BOOT_COUNT, s_boot_count);
+    (void)nvs_set_u8(h, SELFREC_KEY_REBOOT_PEND, s_reboot_pending ? 1 : 0);
+    (void)nvs_set_u8(h, SELFREC_KEY_REBOOT_RSN, s_reboot_reason);
+    r = nvs_commit(h);
+    nvs_close(h);
+    if (r != ESP_OK) {
+        ESP_LOGW(TAG, "selfrec: nvs_commit: %s", esp_err_to_name(r));
+    }
+    return r;
+}
+
+/* Read the self-recovery bookkeeping at boot. If the previous run
+ * asked for a reboot it never recovered, so the consecutive-unhealthy
+ * boot counter grows and the backoff widens. A boot that was not
+ * preceded by a requested reboot (a power cycle) starts the counter
+ * over: the device is not in a reboot loop. */
+static void selfrec_load(void)
+{
+    s_boot_count = 0;
+    s_reboot_pending = false;
+    s_reboot_reason = 0;
+
+    nvs_handle_t h;
+    esp_err_t r = nvs_open(SELFREC_NS, NVS_READONLY, &h);
+    if (r != ESP_OK) {
+        /* First boot, or the namespace was erased on purpose (an
+         * unusable NVS is erased at boot — see provisioning_init). */
+        return;
+    }
+
+    uint32_t bc = 0;
+    uint8_t pend = 0;
+    uint8_t rsn = 0;
+    if (nvs_get_u32(h, SELFREC_KEY_BOOT_COUNT, &bc) != ESP_OK) bc = 0;
+    if (nvs_get_u8(h, SELFREC_KEY_REBOOT_PEND, &pend) != ESP_OK) pend = 0;
+    if (nvs_get_u8(h, SELFREC_KEY_REBOOT_RSN, &rsn) != ESP_OK) rsn = 0;
+    nvs_close(h);
+
+    if (pend) {
+        s_boot_count = bc + 1;
+        s_reboot_reason = rsn;
+        ESP_LOGW(TAG, "selfrec: previous boot asked for a reboot and did not "
+                      "recover — unhealthy boot #%u",
+                 (unsigned)s_boot_count);
+    }
+    s_reboot_pending = false;
+}
+
+/* The wait enforced before the next unhealthy reboot. Doubles per
+ * consecutive unhealthy boot, capped at four hours. */
+static uint32_t reboot_backoff_ms(void)
+{
+    uint32_t shift = s_boot_count;
+    if (shift > 4U) {
+        shift = 4U;
+    }
+    uint32_t ms = REBOOT_BACKOFF_BASE_MS << shift;
+    if (ms > REBOOT_BACKOFF_MAX_MS) {
+        ms = REBOOT_BACKOFF_MAX_MS;
+    }
+    return ms;
+}
+
+/* Loopback GET /health. Uses a raw lwIP socket rather than
+ * esp_http_client so the firmware gains no new managed dependency.
+ * The socket carries send/receive timeouts, so a wedged server
+ * cannot hang the supervisor task indefinitely. */
+static bool http_self_probe(void)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+
+    struct timeval tv;
+    tv.tv_sec  = (long)(SELF_PROBE_TIMEOUT_MS / 1000);
+    tv.tv_usec = (long)((SELF_PROBE_TIMEOUT_MS % 1000) * 1000);
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(80);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    bool ok = false;
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        static const char kReq[] =
+            "GET /health HTTP/1.0\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n\r\n";
+        if (send(fd, kReq, sizeof(kReq) - 1, 0) > 0) {
+            char buf[192];
+            int n = recv(fd, buf, sizeof(buf) - 1, 0);
+            if (n > 0) {
+                buf[n] = '\0';
+                ok = (strstr(buf, " 200 ") != NULL);
+            }
+        }
+    }
+    close(fd);
+    return ok;
+}
+
+/* The camera path is stuck when NEITHER the captured-frame counter
+ * NOR the dropped-frame counter moves. A dead sensor keeps raising
+ * the drop counter, so a broken sensor is reported but never
+ * triggers a reboot — a reboot cannot fix a dead sensor, and
+ * rebooting for it would loop forever. A stuck capture path (the
+ * task wedged, the camera mutex stuck) moves neither counter, and a
+ * reboot is exactly what that needs. */
+static bool camera_path_stuck(void)
+{
+    uint32_t frames = cam_reader_frames_captured_get();
+    uint32_t drops  = cam_reader_fb_drops_get();
+    uint32_t now    = now_ms();
+
+    if (frames != s_last_frame_count) {
+        s_last_frame_count = frames;
+        s_last_frame_seen_ms = now;
+        s_fb_drops_seen = drops;
+        return false;
+    }
+    if (drops != s_fb_drops_seen) {
+        /* Captures are being attempted and every one of them fails:
+         * the sensor is broken. Reported, not rebooted. */
+        s_fb_drops_seen = drops;
+        s_last_frame_seen_ms = now;
+        return false;
+    }
+    return (now - s_last_frame_seen_ms) >= LIVENESS_STALE_MS;
+}
+
+/* Run the HTTP self-probe, rate-limited. Skipped entirely while the
+ * HTTP server is not listening, so a server that has not started yet
+ * is never mistaken for a wedged one. */
+static void run_self_probe(uint32_t now)
+{
+    if (!sta_server_is_running()) {
+        return;
+    }
+    if (s_probe_started && (now - s_probe_last_ms) < SELF_PROBE_INTERVAL_MS) {
+        return;
+    }
+    s_probe_started = true;
+    s_probe_last_ms = now;
+
+    bool ok = http_self_probe();
+    if (ok) {
+        s_probe_fail_streak = 0;
+        s_self_probe_ok = true;
+        return;
+    }
+    s_probe_fail_streak++;
+    if (s_probe_fail_streak >= SELF_PROBE_FAIL_LIMIT) {
+        if (s_self_probe_ok) {
+            ESP_LOGW(TAG, "selfrec: HTTP self-probe failed %u times in a row "
+                          "— the server is not answering on loopback",
+                     (unsigned)s_probe_fail_streak);
+        }
+        s_self_probe_ok = false;
+    }
+}
+
+/* Classify the current outage. This is the gate that keeps a missing
+ * router from ever reaching a reboot. */
+static prov_outage_class_t classify_outage(bool has_ip)
+{
+    if (has_ip) {
+        /* The link is fine — we hold an IP. The only failure left is
+         * our own process not serving. */
+        if (camera_path_stuck() || !s_self_probe_ok) {
+            return PROV_OUTAGE_WEDGED;
+        }
+        return PROV_OUTAGE_NONE;
+    }
+
+    /* No IP. The disconnect reason decides whose fault it is.
+     * WIFI_REASON_NO_AP_FOUND (201) means the scan found no matching
+     * AP: the router is not broadcasting. Reason 0 means no
+     * disconnect event has arrived yet, which is treated the same
+     * way — the safe default is not to reboot on a guess. */
+    uint8_t reason = s_last_disconnect_reason;
+    if (reason == 0 || reason == WIFI_REASON_NO_AP_FOUND) {
+        return PROV_OUTAGE_ROUTER_ABSENT;
+    }
+    return PROV_OUTAGE_LINK_FAILED;
+}
+
+/* Record that the device has been healthy, and clear the
+ * unhealthy-boot counter once it has stayed healthy long enough. A
+ * device that had one bad week must not carry a four-hour backoff
+ * for the rest of its life. */
+static void note_healthy(uint32_t now)
+{
+    if (!s_healthy_tracking) {
+        s_healthy_tracking = true;
+        s_healthy_since_ms = now;
+        return;
+    }
+    if (s_healthy_reset_done) {
+        return;
+    }
+    if ((now - s_healthy_since_ms) < HEALTHY_RESET_AFTER_MS) {
+        return;
+    }
+    s_healthy_reset_done = true;
+    if (s_boot_count != 0 || s_reboot_pending) {
+        ESP_LOGI(TAG, "selfrec: healthy for %u s — clearing the "
+                      "unhealthy-boot counter and the reboot backoff",
+                 (unsigned)(HEALTHY_RESET_AFTER_MS / 1000));
+        s_boot_count = 0;
+        s_reboot_pending = false;
+        (void)selfrec_save();
+    }
+}
+
+/* Step 3 of the ladder. Records the reason, persists it, then
+ * resets. esp_restart() does not return. */
+static void request_reboot(uint8_t reason, const char *why)
+{
+    ESP_LOGE(TAG, "selfrec: step 3 — REBOOT (reason=%u, class=%s, "
+                  "outage=%u s, unhealthy_boots=%u). The cheaper recovery "
+                  "steps are exhausted and the fault is on our side.",
+             (unsigned)reason, why,
+             (unsigned)(s_outage_elapsed_ms / 1000),
+             (unsigned)s_boot_count);
+    s_reboot_pending = true;
+    s_reboot_reason = reason;
+    (void)selfrec_save();
+    /* Let the log reach the console before the reset. */
+    vTaskDelay(pdMS_TO_TICKS(250));
+    esp_restart();
+}
 
 /* Idempotent handler registration helper. Registers both
  * sta_got_ip_event_handler and sta_disconnected_event_handler
@@ -506,25 +855,60 @@ esp_err_t provisioning_init(const provisioning_config_t *cfg,
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Reset reason: lets an operator tell a self-inflicted software
+     * reset (our own recovery reboot) from a power-loss or watchdog
+     * reset, without a serial console being optional. */
+    s_last_reset_reason = (uint8_t)esp_reset_reason();
+    s_boot_started_ms = now_ms();
+    s_last_frame_seen_ms = s_boot_started_ms;
+    ESP_LOGI(TAG, "init: reset reason = %d", (int)s_last_reset_reason);
+
     /* Idempotent NVS init — esp_wifi_set_config() requires
-     * the wifi NVS storage to be ready. */
+     * the wifi NVS storage to be ready.
+     *
+     * An unusable NVS must NEVER leave the device inert. The old
+     * behaviour returned the error here, which made app_main bail:
+     * no camera, no SoftAP, no HTTP server — a powered but dead
+     * chip that only a power cycle could revive, and a reboot
+     * cannot fix it either, because the corruption is in flash.
+     *
+     * Instead: erase and re-initialise, and carry on. The device
+     * then comes up with no credentials and starts its SoftAP
+     * provisioning portal, where the operator can re-provision it.
+     * A device that visibly asks to be provisioned is recoverable;
+     * a device that is silently inert is not. */
     {
         esp_err_t nv = nvs_flash_init();
-        if (nv == ESP_ERR_NVS_NO_FREE_PAGES ||
-            nv == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        if (nv != ESP_OK && nv != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "init: nvs_flash_init: %s", esp_err_to_name(nv));
+            ESP_LOGW(TAG, "init: NVS is unusable — erasing it. The device "
+                          "will come up in SoftAP provisioning mode so it "
+                          "can be re-provisioned.");
             esp_err_t er = nvs_flash_erase();
             if (er != ESP_OK) {
                 ESP_LOGE(TAG, "init: nvs_flash_erase: %s",
                          esp_err_to_name(er));
-                return er;
+            } else {
+                nv = nvs_flash_init();
+                if (nv != ESP_OK && nv != ESP_ERR_INVALID_STATE) {
+                    ESP_LOGE(TAG, "init: nvs_flash_init (after erase): %s",
+                             esp_err_to_name(nv));
+                }
             }
-            nv = nvs_flash_init();
         }
         if (nv != ESP_OK && nv != ESP_ERR_INVALID_STATE) {
-            ESP_LOGE(TAG, "init: nvs_flash_init: %s", esp_err_to_name(nv));
-            return nv;
+            ESP_LOGE(TAG, "init: NVS still unusable — continuing anyway. "
+                          "The device must not be left inert; it will come "
+                          "up in SoftAP provisioning mode.");
         }
     }
+
+    /* Load the self-recovery bookkeeping: the consecutive unhealthy
+     * boot counter and the pending-reboot marker. Both must survive a
+     * power cycle, otherwise the reboot-storm guard resets every time
+     * the power flickers. */
+    selfrec_load();
+    (void)selfrec_save();
 
     memset(&s_prov, 0, sizeof(s_prov));
 
@@ -802,31 +1186,93 @@ static void emit_heartbeat(bool has_ip);
 
 esp_err_t provisioning_supervise_sta(void)
 {
-    /* Backstop watchdog: forces one esp_wifi_connect() if the
-     * station has been without an IP for 4 consecutive ticks
-     * (4 × 30 s = 120 s). This guards against a stuck reconnect
-     * task. The retry cadence itself is owned exclusively by
-     * sta_reconnect_task — this function does NOT call
-     * esp_wifi_connect() on every tick (Defect 3 fix: removed
-     * the || s_sta_disconnected_pending clause that was duplicating
-     * the reconnect task's cadence and overriding its backoff). */
+    uint32_t now = now_ms();
 
-    if (s_sta_got_ip) {
+    /* Liveness self-probe. Rate-limited internally and skipped while
+     * the HTTP server is not listening. */
+    run_self_probe(now);
+
+    /* Classify the outage BEFORE deciding anything. This is the gate
+     * that keeps a missing router from ever reaching a reboot. */
+    prov_outage_class_t cls = classify_outage(s_sta_got_ip);
+    s_outage_class = (uint8_t)cls;
+
+    if (cls == PROV_OUTAGE_NONE) {
         s_no_ip_ticks = 0;
-        emit_heartbeat(true);
+        s_outage_active = false;
+        s_outage_elapsed_ms = 0;
+        s_escalated_reassoc = false;
+        note_healthy(now);
+        emit_heartbeat(s_sta_got_ip);
         return ESP_OK;
     }
 
-    s_no_ip_ticks++;
-    emit_heartbeat(false);
+    if (!s_outage_active) {
+        s_outage_active = true;
+        s_outage_started_ms = now;
+        s_outage_elapsed_ms = 0;
+        ESP_LOGW(TAG, "supervise_sta: outage detected: class=%s",
+                 provisioning_outage_class_name(cls));
+    }
+    s_outage_elapsed_ms = now - s_outage_started_ms;
+    s_healthy_tracking = false;
+    s_healthy_reset_done = false;
 
-    /* Force one reconnect after 4 consecutive no-IP ticks (120 s).
-     * This is a backstop only; the reconnect task handles all normal
-     * retry pacing via exponential backoff. */
-    if (s_no_ip_ticks >= 4) {
+    if (!s_sta_got_ip) {
+        s_no_ip_ticks++;
+    }
+
+    emit_heartbeat(s_sta_got_ip);
+
+    /* Backstop: force one reconnect after 4 consecutive no-IP ticks
+     * (120 s), in case the reconnect task itself is stuck. The retry
+     * cadence is owned by sta_reconnect_task. */
+    if (!s_sta_got_ip && s_no_ip_ticks >= 4) {
         ESP_LOGW(TAG, "supervise_sta: no IP for %u ticks — forcing esp_wifi_connect()",
                  (unsigned)s_no_ip_ticks);
         (void)esp_wifi_connect();
+    }
+
+    /* --- the escalation ladder --- */
+
+    if (cls == PROV_OUTAGE_ROUTER_ABSENT) {
+        /* The router is not broadcasting. A reboot cannot make a
+         * router come alive: rebooting here would waste a boot
+         * cycle and, under a long power event, produce a reboot
+         * storm that looks exactly like the fault we are fixing.
+         * Step 1 of the ladder is all that applies — the reconnect
+         * task keeps trying, without an attempt ceiling, and the
+         * device attaches the moment the router is back. */
+        return ESP_OK;
+    }
+
+    if (cls == PROV_OUTAGE_LINK_FAILED) {
+        /* Step 2 — re-associate. Clears stale driver/BSSID state
+         * without losing the process. Only for the link class: a
+         * wedged server cannot be repaired by dropping the IP, and
+         * doing so would trade a wedged device for an offline one. */
+        if (!s_escalated_reassoc &&
+            s_outage_elapsed_ms >= REASSOCIATE_AFTER_MS) {
+            s_escalated_reassoc = true;
+            ESP_LOGW(TAG, "selfrec: step 2 — re-associating after %u s "
+                          "(the reconnect task has not recovered the link)",
+                     (unsigned)(s_outage_elapsed_ms / 1000));
+            (void)esp_wifi_disconnect();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            (void)esp_wifi_connect();
+        }
+    }
+
+    /* Step 3 — reboot. Reached only when the outage has lasted long
+     * enough AND this boot has already lasted at least the persisted
+     * backoff, so consecutive unhealthy boots space themselves out
+     * instead of looping. */
+    uint32_t backoff = reboot_backoff_ms();
+    if (s_outage_elapsed_ms >= REBOOT_AFTER_MS &&
+        (now - s_boot_started_ms) >= backoff) {
+        request_reboot(cls == PROV_OUTAGE_WEDGED ? REBOOT_RSN_WEDGED
+                                                 : REBOOT_RSN_LINK_FAILED,
+                       provisioning_outage_class_name(cls));
     }
 
     return ESP_OK;
@@ -886,7 +1332,9 @@ static void emit_heartbeat(bool has_ip)
     ESP_LOGI(TAG,
              "supervise_sta: heartbeat: uptime_ms=%lu ip=%s rssi=%d "
              "free_heap=%lu min_free_heap=%lu free_psram=%lu "
-             "reconnect_count=%lu ws_viewer=%s",
+             "reconnect_count=%lu ws_viewer=%s "
+             "outage=%s outage_ms=%lu unhealthy_boots=%lu backoff_ms=%lu "
+             "self_probe=%s frames=%lu drops=%lu reset_reason=%u",
              (unsigned long)uptime_ms,
              ip_str,
              rssi,
@@ -894,7 +1342,16 @@ static void emit_heartbeat(bool has_ip)
              (unsigned long)min_free_heap,
              (unsigned long)free_psram,
              (unsigned long)s_reconnect_count,
-             (ws_fd >= 0) ? "yes" : "no");
+             (ws_fd >= 0) ? "yes" : "no",
+             provisioning_outage_class_name(
+                 (prov_outage_class_t)s_outage_class),
+             (unsigned long)s_outage_elapsed_ms,
+             (unsigned long)s_boot_count,
+             (unsigned long)reboot_backoff_ms(),
+             s_self_probe_ok ? "ok" : "fail",
+             (unsigned long)cam_reader_frames_captured_get(),
+             (unsigned long)cam_reader_fb_drops_get(),
+             (unsigned)s_last_reset_reason);
 }
 
 uint32_t provisioning_reconnect_count(void)
@@ -1014,4 +1471,62 @@ esp_err_t provisioning_apply_captive_form(const char *ssid, const char *password
 
     /* Unreachable — esp_restart() does not return on device. */
     return ESP_OK;
+}
+
+/* ---------- self-recovery public accessors ---------- */
+
+prov_outage_class_t provisioning_outage_class(void)
+{
+    return (prov_outage_class_t)s_outage_class;
+}
+
+const char *provisioning_outage_class_name(prov_outage_class_t cls)
+{
+    switch (cls) {
+        case PROV_OUTAGE_NONE:          return "none";
+        case PROV_OUTAGE_ROUTER_ABSENT: return "router_absent";
+        case PROV_OUTAGE_LINK_FAILED:   return "link_failed";
+        case PROV_OUTAGE_WEDGED:        return "wedged";
+        default:                        return "unknown";
+    }
+}
+
+uint32_t provisioning_outage_elapsed_ms(void)
+{
+    return s_outage_elapsed_ms;
+}
+
+uint32_t provisioning_boot_count(void)
+{
+    return s_boot_count;
+}
+
+uint32_t provisioning_reboot_backoff_ms(void)
+{
+    return reboot_backoff_ms();
+}
+
+uint8_t provisioning_last_reset_reason(void)
+{
+    return s_last_reset_reason;
+}
+
+uint8_t provisioning_reboot_reason(void)
+{
+    return s_reboot_reason;
+}
+
+bool provisioning_self_probe_ok(void)
+{
+    return s_self_probe_ok;
+}
+
+uint32_t provisioning_frames_captured(void)
+{
+    return cam_reader_frames_captured_get();
+}
+
+uint32_t provisioning_frames_dropped(void)
+{
+    return cam_reader_fb_drops_get();
 }
