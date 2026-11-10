@@ -157,11 +157,14 @@ static volatile bool     s_reboot_pending    = false;
 static volatile uint8_t  s_reboot_reason     = 0;
 static volatile uint8_t  s_last_reset_reason = 0;
 
-/* Current outage classification and its age. */
+/* Current outage classification and its age. s_outage_elapsed_ms is
+ * written by the supervisor task and read by the httpd worker through
+ * provisioning_outage_elapsed_ms(), so it is volatile like its
+ * neighbours: a stale read would change what the operator sees. */
 static volatile uint8_t s_outage_class     = PROV_OUTAGE_NONE;
 static bool     s_outage_active   = false;
 static uint32_t s_outage_started_ms = 0;
-static uint32_t s_outage_elapsed_ms = 0;
+static volatile uint32_t s_outage_elapsed_ms = 0;
 
 /* Uptime at boot. The reboot backoff is measured from here, so a
  * device that rebooted recently cannot immediately reboot again. */
@@ -171,7 +174,7 @@ static uint32_t s_boot_started_ms = 0;
 static uint32_t s_last_frame_count   = 0;
 static uint32_t s_last_frame_seen_ms = 0;
 static uint32_t s_fb_drops_seen      = 0;
-static bool     s_self_probe_ok      = true;
+static volatile bool s_self_probe_ok = true;
 static bool     s_probe_started      = false;
 static uint32_t s_probe_fail_streak  = 0;
 static uint32_t s_probe_last_ms      = 0;
