@@ -20,6 +20,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -181,6 +182,12 @@ esp_err_t cam_reader_init(void)
         .fb_location   = (psram_size > 0) ? CAMERA_FB_IN_PSRAM
                                            : CAMERA_FB_IN_DRAM,
         .grab_mode     = CAMERA_GRAB_LATEST,
+
+        /* Pin the JPEG frame buffer size so every copy buffer in the
+         * firmware can be sized to match it exactly. The driver's
+         * own default is width*height/5, which is not a round
+         * number and would drift from the buffers we allocate. */
+        .jpeg_buffer_size = CAM_READER_JPEG_BUFFER_SIZE,
     };
 
     ESP_LOGI(TAG, "init: PSRAM=%zu bytes, fb_count=%d",
@@ -266,6 +273,48 @@ void cam_reader_release(camera_fb_t *fb)
     if (s_cam_mutex != NULL) {
         xSemaphoreGive(s_cam_mutex);
     }
+}
+
+esp_err_t cam_reader_capture_copy(uint8_t *dst, size_t dst_size,
+                                  size_t *out_len, bool flash)
+{
+    if (dst == NULL || out_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_len = 0;
+    if (dst_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    camera_fb_t *fb = NULL;
+    esp_err_t r = flash ? cam_reader_capture_with_flash(&fb, true)
+                        : cam_reader_capture(&fb);
+    if (r != ESP_OK || fb == NULL) {
+        /* ESP_FAIL means the mutex WAS taken and the sensor produced
+         * no frame: the mutex must be given back. Every other error
+         * means the mutex was never taken, and must NOT be. */
+        if (r == ESP_FAIL) {
+            cam_reader_release(NULL);
+        }
+        return (r == ESP_OK) ? ESP_FAIL : r;
+    }
+
+    if (fb->len > dst_size) {
+        ESP_LOGE(TAG, "capture_copy: frame of %u bytes does not fit in a "
+                      "%u byte buffer",
+                 (unsigned)fb->len, (unsigned)dst_size);
+        cam_reader_release(fb);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    memcpy(dst, fb->buf, fb->len);
+    *out_len = fb->len;
+
+    /* Give the frame buffer back AND release the camera. From here
+     * the caller owns the copy and the sensor is free, so a slow
+     * network write cannot starve anyone else. */
+    cam_reader_release(fb);
+    return ESP_OK;
 }
 
 /* ---- Flash LED (GPIO 4) ----

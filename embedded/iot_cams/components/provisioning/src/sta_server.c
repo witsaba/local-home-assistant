@@ -50,14 +50,169 @@
 #include "esp_system.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_heap_caps.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "cam_reader.h"
 #include "ws_cams.h"
+
+/* The provisioning component's public seam. provisioning.h pulls in
+ * only <stddef.h>, <stdbool.h> and <esp_err.h>, so it is safe to
+ * include here: the accessors below live behind it. */
+#include "provisioning.h"
+
+/* Forward declaration for the ws_cams viewer fd accessor. */
+extern int ws_cams_viewer_fd_get(void);
 
 static const char *TAG = "sta_srv";
 
 /* The httpd handle. NULL when not running. */
 static httpd_handle_t s_sta_httpd = NULL;
+
+/* The /capture response buffer.
+ *
+ * The frame is copied out of the camera and the CAMERA IS RELEASED
+ * before the socket write, so a slow client can never hold the
+ * sensor. Holding it across the write was the original defect: the
+ * write is bounded by the httpd's `send_wait_timeout` (5 s), and a
+ * stalled client held the camera for the whole of it.
+ *
+ * The buffer is shared between concurrent /capture requests and is
+ * protected by a real MUTEX — a binary semaphore has no FreeRTOS
+ * priority inheritance, which is the same wart that made the
+ * original starvation invisible. */
+static uint8_t *s_capture_buf = NULL;
+static SemaphoreHandle_t s_capture_buf_mtx = NULL;
+
+/* ---------- /health ---------- */
+
+/* GET /health — diagnostics JSON.
+ *
+ * Returns 200 with a JSON body describing the device's network and
+ * memory health. Never returns 500 — if WiFi is down the endpoint
+ * still answers with RSSI -1 and IP 0.0.0.0 so an off-network or
+ * wedged device can still be diagnosed.
+ *
+ * Fields:
+ *   uptime_ms        — milliseconds since boot (monotonic)
+ *   free_heap        — bytes of free internal RAM right now
+ *   min_free_heap    — lowest-ever free internal RAM since boot
+ *   free_psram       — bytes of free PSRAM (0 if not present)
+ *   ip               — current IPv4 address, "0.0.0.0" if not connected
+ *   rssi             — current WiFi RSSI in dBm, -1 if not connected
+ *   reconnect_count  — number of esp_wifi_connect() calls issued
+ *                      by the reconnect task since boot
+ *   last_disconn_rc  — wifi_event_sta_disconnected_t.reason from
+ *                      the most recent disconnect, 0 if none
+ *   ws_viewer        — 1 if a WS viewer is currently attached, 0 otherwise
+ *
+ * The off-network / wedged / healthy discriminator:
+ *   off-network — ip == "0.0.0.0", rssi == -1
+ *   wedged     — ip != "0.0.0.0", heap collapsing
+ *   healthy    — ip present, RSSI reasonable, reconnect_count stable
+ */
+static esp_err_t health_get_handler(httpd_req_t *req)
+{
+    if (!req) return ESP_FAIL;
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    /* Uptime: use xTaskGetTickCount() × portTICK_PERIOD_MS.
+     * Both are always available without any new includes.
+     * xTaskGetTickCount is safe to call from an ISR or task. */
+    uint32_t uptime_ms = (uint32_t)(
+        (uint64_t)xTaskGetTickCount() * (uint64_t)portTICK_PERIOD_MS);
+
+    uint32_t free_heap     = esp_get_free_heap_size();
+    uint32_t min_free_heap = esp_get_minimum_free_heap_size();
+    uint32_t free_psram    = 0;
+#if CONFIG_ESP32_SPIRAM_SUPPORT || CONFIG_ESP_SPIRAM
+    free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+#endif
+
+    /* IP address from the station netif. Graceful fallback if
+     * the station is not connected: report 0.0.0.0 rather than
+     * returning 500 — /health must still answer when the device
+     * is off-network. */
+    char ip_str[16] = "0.0.0.0";
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta_netif) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
+            snprintf(ip_str, sizeof(ip_str), IPSTR,
+                     IP2STR(&ip_info.ip));
+        }
+    }
+
+    /* RSSI from the AP record. Graceful fallback: report -1 when
+     * the station is not connected (esp_wifi_sta_get_ap_info returns
+     * ESP_ERR_WIFI_NOT_CONNECT). */
+    int rssi = -1;
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        rssi = (int)ap_info.rssi;
+    }
+
+    uint32_t reconn    = provisioning_reconnect_count();
+    uint8_t  disconn  = provisioning_last_disconnect_reason();
+    int      ws_fd     = ws_cams_viewer_fd_get();
+    int      ws_viewer = (ws_fd >= 0) ? 1 : 0;
+
+    /* Self-recovery state. The outage class is the field an
+     * operator reads first: "router_absent" means the environment
+     * is at fault and the device is waiting politely, "link_failed"
+     * and "wedged" mean the device is escalating on its own. */
+    const char *outage   = provisioning_outage_class_name(
+                                provisioning_outage_class());
+    uint32_t    outage_ms = provisioning_outage_elapsed_ms();
+    uint32_t    boots     = provisioning_boot_count();
+    uint32_t    backoff   = provisioning_reboot_backoff_ms();
+    uint8_t     reset_rsn = provisioning_last_reset_reason();
+    uint8_t     reboot_rsn= provisioning_reboot_reason();
+    int         probe_ok  = provisioning_self_probe_ok() ? 1 : 0;
+    uint32_t    frames    = provisioning_frames_captured();
+    uint32_t    drops     = provisioning_frames_dropped();
+
+    char buf[640];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"uptime_ms\":%lu,\"free_heap\":%lu,\"min_free_heap\":%lu,"
+        "\"free_psram\":%lu,\"ip\":\"%s\",\"rssi\":%d,"
+        "\"reconnect_count\":%lu,\"last_disconn_rc\":%u,\"ws_viewer\":%d,"
+        "\"outage\":\"%s\",\"outage_ms\":%lu,\"unhealthy_boots\":%lu,"
+        "\"backoff_ms\":%lu,\"self_probe_ok\":%d,"
+        "\"frames_captured\":%lu,\"frames_dropped\":%lu,"
+        "\"reset_reason\":%u,\"reboot_reason\":%u}",
+        (unsigned long)uptime_ms,
+        (unsigned long)free_heap,
+        (unsigned long)min_free_heap,
+        (unsigned long)free_psram,
+        ip_str,
+        rssi,
+        (unsigned long)reconn,
+        (unsigned)disconn,
+        ws_viewer,
+        outage,
+        (unsigned long)outage_ms,
+        (unsigned long)boots,
+        (unsigned long)backoff,
+        probe_ok,
+        (unsigned long)frames,
+        (unsigned long)drops,
+        (unsigned)reset_rsn,
+        (unsigned)reboot_rsn);
+
+    if (len < 0 || (size_t)len >= sizeof(buf)) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "{\"error\":\"buf_overflow\"}");
+        return ESP_OK;
+    }
+
+    httpd_resp_send(req, buf, len);
+    return ESP_OK;
+}
 
 /* ---------- /whoami ---------- */
 
@@ -118,25 +273,66 @@ static esp_err_t whoami_get_handler(httpd_req_t *req)
         default: chip_str = "ESP32-UNKNOWN"; break;
     }
 
-    /* Device name from Kconfig. */
+    /* Device name and firmware version from provisioning. */
     extern const char *prov_device_name(void);
     const char *name = prov_device_name();
     const char *description = "";  /* no identity NVS yet */
+    const char *fw_ver = prov_fw_version();
+
+    /* Uptime in seconds (monotonic, integer). */
+    uint32_t uptime_s = ((uint32_t)xTaskGetTickCount() * (uint32_t)portTICK_PERIOD_MS) / 1000U;
+
+    /* Live IP and RSSI. Graceful fallback: "0.0.0.0" and -1 when
+     * the station is not connected. */
+    char ip_str[16] = "0.0.0.0";
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta_netif) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
+            snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+        }
+    }
+
+    int rssi = -1;
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        rssi = (int)ap_info.rssi;
+    }
 
     /* Build JSON response using static buffer (no heap allocation).
-     * Format: {"mac":"...","name":"...","fw":"...","chip":"..."}
-     * description is omitted when empty (saves 14 bytes). */
-    char buf[160];
+     * Format: {"mac":"...","name":"...","fw":"...","chip":"...",
+     *          "idf":"...","ip":"...","rssi":N,"uptime_s":N}
+     *
+     * fw: application firmware version (e.g. "0.1.0"), NOT esp_get_idf_version().
+     *     The backend uses fw to identify which deployed image is running;
+     *     esp_get_idf_version() (e.g. "v5.5.3") is meaningless for that purpose.
+     *
+     * idf: ESP-IDF version string. Additive field — Go's encoding/json
+     *      ignores unknown fields, so this is safe for existing backends.
+     *
+     * ip, rssi, uptime_s: live state. Fallback values when the station
+     *     is not connected (off-network / wedged) so the endpoint still
+     *     answers 200 instead of 500. */
+    char buf[256];
     int len;
     if (description[0] == '\0') {
-        /* Omit description when empty. */
         len = snprintf(buf, sizeof(buf),
-            "{\"mac\":\"%s\",\"name\":\"%s\",\"fw\":\"%s\",\"chip\":\"%s\"}",
-            mac_hex, name, esp_get_idf_version(), chip_str);
+            "{\"mac\":\"%s\",\"name\":\"%s\",\"fw\":\"%s\",\"chip\":\"%s\","
+            "\"idf\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"uptime_s\":%u}",
+            mac_hex, name,
+            fw_ver[0] ? fw_ver : "unknown",
+            chip_str,
+            esp_get_idf_version(),
+            ip_str, rssi, (unsigned)uptime_s);
     } else {
         len = snprintf(buf, sizeof(buf),
-            "{\"mac\":\"%s\",\"name\":\"%s\",\"description\":\"%s\",\"fw\":\"%s\",\"chip\":\"%s\"}",
-            mac_hex, name, description, esp_get_idf_version(), chip_str);
+            "{\"mac\":\"%s\",\"name\":\"%s\",\"description\":\"%s\",\"fw\":\"%s\",\"chip\":\"%s\","
+            "\"idf\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"uptime_s\":%u}",
+            mac_hex, name, description,
+            fw_ver[0] ? fw_ver : "unknown",
+            chip_str,
+            esp_get_idf_version(),
+            ip_str, rssi, (unsigned)uptime_s);
     }
 
     if (len < 0 || (size_t)len >= sizeof(buf)) {
@@ -209,21 +405,39 @@ static esp_err_t capture_get_handler(httpd_req_t *req)
         }
     }
 
-    camera_fb_t *fb = NULL;
-    esp_err_t r = cam_reader_capture_with_flash(&fb, flash);
-
-    if (r == ESP_ERR_TIMEOUT) {
-        ESP_LOGW(TAG, "capture: mutex timeout; another caller busy");
+    /* One capture at a time. The mutex protects the shared response
+     * buffer, NOT the camera: the camera is released inside
+     * cam_reader_capture_copy, before the socket write below. */
+    if (s_capture_buf == NULL || s_capture_buf_mtx == NULL) {
+        ESP_LOGE(TAG, "capture: no response buffer");
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "text/plain");
         httpd_resp_sendstr(req, "Camera busy, please try again");
         return ESP_OK;
     }
-    if (r != ESP_OK || fb == NULL) {
-        ESP_LOGE(TAG, "capture: sensor returned no frame (flash=%d)",
-                 (int)flash);
+
+    xSemaphoreTake(s_capture_buf_mtx, portMAX_DELAY);
+
+    /* Copy the frame out; the camera is released before this
+     * returns, so the socket write below blocks nobody else. */
+    size_t len = 0;
+    esp_err_t r = cam_reader_capture_copy(s_capture_buf,
+                                          CAM_READER_JPEG_BUFFER_SIZE,
+                                          &len, flash);
+
+    if (r == ESP_ERR_TIMEOUT) {
+        xSemaphoreGive(s_capture_buf_mtx);
+        ESP_LOGW(TAG, "capture: camera busy; another caller holds it");
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, "Camera busy, please try again");
+        return ESP_OK;
+    }
+    if (r != ESP_OK) {
+        xSemaphoreGive(s_capture_buf_mtx);
+        ESP_LOGE(TAG, "capture: sensor returned no frame (flash=%d): %s",
+                 (int)flash, esp_err_to_name(r));
         httpd_resp_send_500(req);
-        cam_reader_release(NULL);  /* drop the mutex */
         return ESP_FAIL;
     }
 
@@ -239,8 +453,11 @@ static esp_err_t capture_get_handler(httpd_req_t *req)
         httpd_resp_set_hdr(req, "X-Witsaba-Flash", "1");
     }
 
-    esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-    cam_reader_release(fb);
+    /* The camera has been released. This write may block for as long
+     * as the client takes, and it now blocks nobody else. */
+    esp_err_t res = httpd_resp_send(req, (const char *)s_capture_buf, len);
+
+    xSemaphoreGive(s_capture_buf_mtx);
 
     if (res == ESP_OK) {
         ESP_LOGD(TAG, "capture: served frame flash=%d", (int)flash);
@@ -259,11 +476,62 @@ esp_err_t sta_server_start(void)
         return ESP_OK;
     }
 
+    /* The /capture response buffer. Sized to match the camera's own
+     * JPEG buffer so a frame can never be larger than the buffer it
+     * is copied into. PSRAM first, internal DRAM as a fallback. */
+    if (s_capture_buf == NULL) {
+        s_capture_buf = heap_caps_malloc(CAM_READER_JPEG_BUFFER_SIZE,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_capture_buf == NULL) {
+            s_capture_buf = heap_caps_malloc(CAM_READER_JPEG_BUFFER_SIZE,
+                                             MALLOC_CAP_8BIT);
+        }
+        if (s_capture_buf == NULL) {
+            /* Not fatal: /whoami, /health and /ws/cams still work;
+             * only /capture is unavailable. */
+            ESP_LOGE(TAG, "sta_server_start: no memory for the capture "
+                          "buffer (%d bytes) — /capture is unavailable",
+                     (int)CAM_READER_JPEG_BUFFER_SIZE);
+        }
+    }
+    if (s_capture_buf_mtx == NULL) {
+        s_capture_buf_mtx = xSemaphoreCreateMutex();
+        if (s_capture_buf_mtx == NULL) {
+            ESP_LOGE(TAG, "sta_server_start: xSemaphoreCreateMutex failed");
+        }
+    }
+
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
     cfg.stack_size = 4096;
     cfg.max_uri_handlers = 8;
     cfg.max_req_hdr_len = 512;
+
+    /* Defect B fix, part 1 — size the socket pool.
+     * Three /ws/cams viewers (one per camera, single-viewer
+     * enforcement exists) hold 3 sockets permanently. A CCTV
+     * grid with all three cameras open holds 3 WS + 3 capture
+     * sessions + discovery polling + slack. HTTPD_DEFAULT_CONFIG
+     * leaves max_open_sockets=7 with lru_purge_enable=false,
+     * so the pool never self-reclaims and new connections
+     * stall in backlog_conn=5. */
+    cfg.max_open_sockets = 12;
+    cfg.lru_purge_enable = true;
+
+    /* Defect B fix, part 2 — bound how long a half-dead client
+     * pins a thread + socket. Request parsing needs no longer
+     * than 3 s. send_wait_timeout stays at the 5 s default —
+     * a ~30 KB JPEG on a weak link genuinely needs it. */
+    cfg.recv_wait_timeout = 3;
+
+    /* Defect B fix, part 3 — raise httpd worker priority above
+     * the camera stream producer. Priority invariant:
+     * esp_event (20) > httpd (5) > cam_stream (3).
+     * The old priority (tskIDLE_PRIORITY+5 = 1) let the
+     * cam_stream producer at priority 5 starve the httpd
+     * workers that all discovery, surveillance, and the UI
+     * depend on. */
+    cfg.task_priority = 5;
 
     esp_err_t err = httpd_start(&s_sta_httpd, &cfg);
     if (err != ESP_OK) {
@@ -300,6 +568,23 @@ esp_err_t sta_server_start(void)
     err = httpd_register_uri_handler(s_sta_httpd, &capture_uri);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "register /capture failed: %s", esp_err_to_name(err));
+        httpd_stop(s_sta_httpd);
+        s_sta_httpd = NULL;
+        return err;
+    }
+
+    /* Register /health — diagnostics endpoint for network and memory
+     * observability. Same handle, same audience (post-provisioning
+     * LAN clients and the Pi monitoring agent). */
+    httpd_uri_t health_uri = {
+        .uri       = "/health",
+        .method    = HTTP_GET,
+        .handler   = health_get_handler,
+        .user_ctx  = NULL,
+    };
+    err = httpd_register_uri_handler(s_sta_httpd, &health_uri);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "register /health failed: %s", esp_err_to_name(err));
         httpd_stop(s_sta_httpd);
         s_sta_httpd = NULL;
         return err;
@@ -350,6 +635,15 @@ void sta_server_stop(void)
     }
     s_sta_httpd = NULL;
     ESP_LOGI(TAG, "STA server stopped");
+
+    if (s_capture_buf != NULL) {
+        free(s_capture_buf);
+        s_capture_buf = NULL;
+    }
+    if (s_capture_buf_mtx != NULL) {
+        vSemaphoreDelete(s_capture_buf_mtx);
+        s_capture_buf_mtx = NULL;
+    }
 }
 
 bool sta_server_is_running(void)

@@ -15,6 +15,9 @@
 #   - esp_http_server — captive portal's GET /, /provision, /scan
 #     and sta_server's GET /whoami handlers
 #   - json       — JSON /whoami response payload
+#   - lwip       — raw loopback socket used by the /health self-probe
+#     (the self-recovery liveness signal; deliberately not
+#     esp_http_client, so the firmware gains no new managed dep)
 #
 # protocomm and wifi_provisioning are NO LONGER linked because
 # the captive portal flow talks to esp_wifi directly without the
@@ -27,5 +30,5 @@ idf_component_register(
          "src/ws_cams.c"
          "src/wifi_cred.c"
     INCLUDE_DIRS "include"
-    REQUIRES esp_wifi esp_netif esp_event nvs_flash mdns esp_http_server json cam_reader cam_stream
+    REQUIRES esp_wifi esp_netif esp_event nvs_flash mdns esp_http_server json cam_reader cam_stream lwip
 )

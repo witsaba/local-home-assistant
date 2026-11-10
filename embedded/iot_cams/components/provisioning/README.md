@@ -266,12 +266,310 @@ Response:
 
 ```json
 {
+  "mac": "e08cfe3091b0",
   "name": "iot-cam",
-  "fw_version": "0.1.0",
-  "softap_ssid": "IoT-Cam_3091B0",
-  "softap_security": "WIFI_AUTH_WPA2_PSK"
+  "fw": "0.1.0",
+  "idf": "v5.5.3",
+  "chip": "ESP32-D0WDQ6",
+  "ip": "192.168.1.51",
+  "rssi": -51,
+  "uptime_s": 3012
 }
 ```
+
+`fw` is the **application** firmware version, recorded from
+`provisioning_app_info_t.fw_version` at `provisioning_init()` and
+served through the `prov_fw_version()` seam. It used to report
+`esp_get_idf_version()` instead, which meant an operator could not
+tell what firmware a device was running — precisely the thing
+needed during an incident. The ESP-IDF version is still available,
+under `idf`.
+
+`ip`, `rssi`, and `uptime_s` are live state rather than identity.
+They degrade gracefully when the station is down: `rssi` becomes
+`-1` and `ip` becomes `0.0.0.0`.
+
+The response is assembled with `snprintf` into a 256-byte buffer and
+an explicit overflow guard that returns `500` rather than
+truncating. If you add a field, grow the buffer in the same commit.
+
+---
+
+## Diagnostics endpoint: `/health`
+
+Registered on the same STA httpd handle as `/whoami` and
+`/capture`. Same audience: post-provisioning LAN clients, plus the
+Pi monitoring agent.
+
+```bash
+curl -s http://<camera-ip>/health
+```
+
+```json
+{
+  "uptime_ms": 301234,
+  "free_heap": 120432,
+  "min_free_heap": 89200,
+  "free_psram": 1966080,
+  "ip": "192.168.1.51",
+  "rssi": -51,
+  "reconnect_count": 3,
+  "last_disconn_rc": 201,
+  "ws_viewer": 0
+}
+```
+
+The point of this endpoint is to separate three failure shapes that
+look identical from outside — a device that answers nothing at all:
+
+| Observation | Meaning |
+| --- | --- |
+| `ip` = `0.0.0.0` | The station is off-network. The link dropped and did not recover. |
+| `ip` present, `min_free_heap` low and falling | The httpd is alive but starved. Pool or heap exhaustion. |
+| `ip` present, healthy heap | Neither. Look at the heartbeat log or the caller. |
+
+It never returns `500`. `esp_wifi_sta_get_ap_info` and
+`esp_netif_get_ip_info` failures degrade to `rssi` = `-1` and `ip` =
+`0.0.0.0`, because a device that is off-network is exactly the case
+where `/health` has to still answer.
+
+`last_disconn_rc` is the `wifi_event_sta_disconnected_t.reason`
+enum. `201` is `WIFI_REASON_AUTH_EXPIRE`, `202` is
+`WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT`, `203` is
+`WIFI_REASON_BEACON_TIMEOUT`. See `esp_wifi_types_generic.h` for
+the full table — a persistent `203` means the AP stopped hearing
+beacons, which is a coverage problem, not a firmware one.
+
+---
+
+## Network liveness
+
+### What the device does when the link drops
+
+Reconnection is owned by a dedicated FreeRTOS task, `sta_reconnect`,
+and never by an event handler. `WIFI_EVENT_STA_DISCONNECTED` is
+dispatched on the `esp_event` task, so anything that blocks there
+stalls **every** event in the system, including IP and WiFi events.
+The handler is therefore O(1): record the reason, clear
+`s_sta_got_ip`, set the pending flag, poke the task, return.
+
+The task blocks on `ulTaskNotifyTake(pdTRUE, portMAX_DELAY)`, so a
+healthy device spends no CPU on it. When poked it retries
+**forever** at 2 / 4 / 8 / 16 / 30 s, capped at 30 s, resetting when
+the station re-attaches. There is deliberately no attempt ceiling:
+a device that stops retrying is the failure mode, not the fix.
+
+In the log, `reconnect: esp_wifi_connect (backoff=Xms)` always means
+"this attempt followed a sleep of X ms". The very first attempt after
+a disconnect logs `attempt after disconnect` with no backoff label,
+because it did not sleep.
+
+`provisioning_supervise_sta()` is a separate 120 s backstop. It is
+not part of the retry cadence — if the reconnect task is stuck, the
+supervisor forces one `esp_wifi_connect()` so a wedged task cannot
+become an outage.
+
+### Heartbeat
+
+`provisioning_supervise_sta()` also emits a periodic heartbeat
+carrying the same fields as `/health`:
+
+- station has an IP: every 10 ticks (~5 min)
+- station has no IP: every tick (30 s)
+
+The unhealthy cadence is deliberately chatty. An operator
+diagnosing an outage needs to see the disconnect happen, not infer
+it from silence.
+
+### WiFi power save
+
+`esp_wifi_set_ps(WIFI_PS_NONE)` is called after `esp_wifi_start()`
+on both boot paths. The ESP-IDF default is `WIFI_PS_MIN_MODEM`,
+which AP-buffers upstream ARP, ICMP, and DHCP traffic during DTIM
+sleep. That is the right trade for a battery device and the wrong
+one for a mains-powered camera that must always answer on the LAN.
+
+### Task priority invariant
+
+```
+wifi_task (23) > esp_event (20) > httpd (5) > cam_stream (3)
+```
+
+The camera stream producer runs every 100 ms and does a full PSRAM
+capture plus JPEG encode. If it outranks the httpd workers, `/whoami`
+and `/capture` starve while the device looks alive. `cam_stream` is
+deliberately below `httpd` for that reason; if you add a task that
+serves a client-facing endpoint, put it at 5 or above.
+
+### Operator recovery procedure
+
+When a camera stops answering any endpoint:
+
+1. `ping <ip>`. A reply means the link and IP are alive and the
+   httpd is wedged — check `/health` heap numbers and whether the
+   `/stream` CCTV grid was open. No reply, or an absent/stale ARP
+   entry, means the station dropped off.
+2. On the serial console, `reconnect: esp_wifi_connect` lines mean
+   the station is actively retrying; `station connected ... ip=`
+   means it recovered. Silence with no reconnect lines means the
+   disconnect handler never fired — check whether the device is
+   still associated (AP client list) and look for a
+   `disconnected after IP was acquired` line, which would mean this
+   build is not running.
+3. There is no remote reboot endpoint, so recovery requires physical
+   access. See "Follow-ups" in
+   [`odd/tasks/iot-cams-network-liveness.md`](../../../../odd/tasks/iot-cams-network-liveness.md)
+   for the deferred `/reboot` proposal and why it needs an explicit
+   security decision first.
+
+---
+
+## Self-recovery: incremental escalation and the conditional reboot
+
+### Why this exists
+
+The deployment has common power cuts and the cameras have no battery.
+Two situations follow from that, and the device now handles both on
+its own:
+
+- **The chip comes back before the router does.** After a power cut
+  the ESP32 may boot and run while the router is still off or still
+  booting. The device must reach the home AP on its own once the
+  router appears — no human, no PC, no Pi.
+- **The device wedges and stays wedged.** A camera that is powered but
+  no longer answers on the network used to need a physical power
+  cycle, because nothing in the firmware could recover it.
+
+The response is **incremental**: cheapest action first, and a reboot
+only when the cheaper steps are exhausted *and* the fault is provably
+on our side of the wire.
+
+### The escalation ladder
+
+| Step | Action | Dwell before it fires |
+|---|---|---|
+| 1 | reconnect — `esp_wifi_connect()`, owned by `sta_reconnect_task`, backoff 2→4→8→16→30 s capped at 30 s, **no attempt ceiling** | immediate on any disconnect |
+| 2 | re-associate — `esp_wifi_disconnect()` then `esp_wifi_connect()`, clearing stale driver/BSSID state without losing the process | 2 min into a `link_failed` outage |
+| 3 | reboot — `esp_restart()`, a full reset of CPU, radio and driver state | 15 min into the outage **and** this boot has already lasted the persisted backoff |
+
+Step 1 is the one that matters for a power cut: the reconnect task
+retries **forever**. When the router finally comes up, the device
+attaches on its own.
+
+### The outage classes — and the rule that protects a power event
+
+Every supervisor tick (30 s) classifies the outage before deciding
+anything:
+
+| Class | Meaning | Escalates to a reboot? |
+|---|---|---|
+| `none` | healthy | no |
+| `router_absent` | the scan found no matching AP — **the router is not broadcasting** | **never** |
+| `link_failed` | the AP was found, the link could not be established | yes, via steps 2 then 3 |
+| `wedged` | we hold an IP but the device is not serving | yes, via step 3 |
+
+**`router_absent` never reaches the reboot step.** A reboot cannot
+make a dead router come alive; it only wastes a boot cycle, and under
+a long power event a sequence of reboots is indistinguishable from
+the fault we are trying to fix. In that class the device keeps
+retrying, quietly, and attaches the moment the router is back.
+
+The classifier reads the reason code from
+`wifi_event_sta_disconnected_t.reason`: `WIFI_REASON_NO_AP_FOUND`
+(201) means the AP was not found, so the environment is at fault. Any
+other reason means the AP was found and the link failed, so the device
+is the suspect. A reason code of 0 (no disconnect event yet) is
+treated as `router_absent`, because rebooting on a guess is worse
+than waiting.
+
+### The reboot-storm guard
+
+Each unhealthy reboot increments a counter persisted in the NVS
+namespace `selfrec`, and the counter widens the wait before the next
+reboot:
+
+| Consecutive unhealthy boots | Wait before the next reboot |
+|---|---|
+| 0 | 15 min |
+| 1 | 30 min |
+| 2 | 60 min |
+| 3 | 120 min |
+| 4 or more | 240 min (cap) |
+
+The counter is cleared once the device has proved healthy for 10
+minutes, so a device that had one bad week does not carry a
+four-hour backoff for the rest of its life. A boot that was not
+preceded by a requested reboot (a plain power cycle) also resets it:
+the device is not in a reboot loop.
+
+This guard matters because a reboot is a **current spike** — PSRAM
+init, the camera's 20 MHz XCLK, WiFi TX. Under a marginal supply an
+unguarded timer turns the fix into the disease.
+
+### The liveness signals
+
+Two independent signals, neither of which needs an external client:
+
+- **Camera progress** — `cam_reader_frames_captured_get()` must keep
+  advancing. The signal is stale only when *neither* the captured
+  frame counter *nor* `cam_reader_fb_drops_get()` has moved for 10
+  minutes. A dead sensor keeps raising the drop counter, so a broken
+  sensor is reported but never rebooted: a reboot cannot fix a dead
+  sensor, and rebooting for it would loop forever. Only a capture
+  path that has stopped moving entirely counts as stale.
+- **HTTP self-probe** — the supervisor issues a loopback
+  `GET /health` against `127.0.0.1` every 2 minutes over a raw lwIP
+  socket (no new managed dependency) and requires a `200`. Three
+  consecutive failures mark the server as wedged.
+
+Either signal being stale classifies the device as `wedged`. The
+camera counter alone cannot detect a wedged HTTP server (the camera
+keeps advancing), and the self-probe alone cannot detect a wedged
+camera, so both are needed.
+
+### The boot path never leaves the device inert
+
+An unusable NVS — for instance `ESP_ERR_NVS_CORRUPT` after a
+brownout during an NVS write — used to make `provisioning_init()`
+return an error, which made `app_main` bail: no camera, no SoftAP,
+no HTTP server. The chip was powered and completely dead, and a
+reboot could not fix it either, because the corruption lives in
+flash.
+
+Now the boot path erases the unusable NVS and carries on. The device
+comes up with no credentials and starts its SoftAP provisioning
+portal, where the operator can re-provision it. A device that visibly
+asks to be provisioned is recoverable; a device that is silently
+inert is not.
+
+### Reading the state
+
+`/health` gained these fields:
+
+| Field | Meaning |
+|---|---|
+| `outage` | `none`, `router_absent`, `link_failed` or `wedged` |
+| `outage_ms` | how long the current outage has lasted |
+| `unhealthy_boots` | the consecutive unhealthy boot counter |
+| `backoff_ms` | the wait enforced before the next reboot |
+| `self_probe_ok` | `1` when the last loopback probe answered |
+| `frames_captured` / `frames_dropped` | the camera counters behind the liveness signal |
+| `reset_reason` | `esp_reset_reason()` captured at boot — `ESP_RST_SW` means our own recovery reboot |
+| `reboot_reason` | why the last reboot was requested (1 = link failed, 2 = wedged) |
+
+The heartbeat log line carries the same fields, and every boot logs
+`init: reset reason = <n>`, so a self-inflicted reset is
+distinguishable from a power-loss reset without a serial console.
+
+### What this does not fix
+
+- A **dead sensor** is reported, not rebooted. Rebooting cannot fix
+  it.
+- A **router that never comes back** is waited for, not rebooted at.
+- **NVS corruption** is recovered by erasing, not by rebooting — it
+  is flash-resident.
+- There is still **no OTA partition**, so this ships as one firmware
+  image for one serial flash round on all three devices.
 
 ---
 
