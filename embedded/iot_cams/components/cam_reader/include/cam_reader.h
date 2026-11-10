@@ -33,12 +33,26 @@
 #ifndef IOT_CAMS_CAM_READER_H
 #define IOT_CAMS_CAM_READER_H
 
+#include <stddef.h>
+#include <stdbool.h>
+
 #include "esp_err.h"
 #include "esp_camera.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/** Size of the JPEG frame buffer, in bytes.
+ *
+ *  The camera driver is configured with exactly this value
+ *  (`camera_config_t.jpeg_buffer_size`), and every copy buffer in
+ *  this firmware is sized to match, so a frame can never be larger
+ *  than the buffer it is copied into. The driver's own default for
+ *  SVGA (800x600) is `width * height / 5` = 96 000; this is that
+ *  value rounded up to whole 4 KB pages.
+ */
+#define CAM_READER_JPEG_BUFFER_SIZE 98304
 
 /** Boot the OV2640 sensor and create the camera mutex.
  *
@@ -145,6 +159,49 @@ esp_err_t cam_reader_flash_init(void);
  *  @return same outcomes as `cam_reader_capture`.
  */
 esp_err_t cam_reader_capture_with_flash(camera_fb_t **fb, bool flash);
+
+/** Capture one JPEG frame and COPY it into a caller-owned buffer,
+ *  releasing the camera before returning.
+ *
+ *  This is the API every network consumer should use. The camera
+ *  mutex must NEVER be held across a socket write: a blocking
+ *  `httpd_resp_send` or `httpd_ws_send_frame_async` can stall for
+ *  the whole `send_wait_timeout` (5 s by default), and holding the
+ *  sensor for that long starves every other consumer of it — the
+ *  picture request and the stream fight over the camera instead of
+ *  over the network.
+ *
+ *  The copy costs one memcpy of the frame (~22 KB, about 1 ms) and
+ *  the caller owns the buffer afterwards, so it may hold it for as
+ *  long as it likes without blocking the sensor.
+ *
+ *  @param[out] dst      destination buffer.
+ *  @param[in]  dst_size size of `dst`; must be at least
+ *                       `CAM_READER_JPEG_BUFFER_SIZE` to be safe
+ *                       for any frame the driver can produce.
+ *  @param[out] out_len  receives the number of bytes written.
+ *  @param[in]  flash    true to illuminate the flash LED for the
+ *                       capture, exactly as
+ *                       `cam_reader_capture_with_flash` does.
+ *
+ *  @return
+ *    - `ESP_OK`            the frame was copied; *out_len > 0. The
+ *                          camera has already been released.
+ *    - `ESP_ERR_TIMEOUT`   mutex contention; the 5 s budget elapsed.
+ *                          The mutex was never taken — do NOT
+ *                          release it.
+ *    - `ESP_FAIL`          the mutex was taken but the sensor
+ *                          produced no frame. The mutex has already
+ *                          been released.
+ *    - `ESP_ERR_INVALID_SIZE` the frame did not fit in `dst`. The
+ *                          camera has already been released.
+ *    - `ESP_ERR_INVALID_ARG` a NULL pointer was passed.
+ *    - `ESP_ERR_INVALID_STATE` `cam_reader_init` not called, or the
+ *                          flash was requested before
+ *                          `cam_reader_flash_init`.
+ */
+esp_err_t cam_reader_capture_copy(uint8_t *dst, size_t dst_size,
+                                  size_t *out_len, bool flash);
 
 #ifdef __cplusplus
 }
