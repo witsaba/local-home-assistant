@@ -178,3 +178,14 @@ together in one branch and one image, not as two PRs requiring two flash rounds.
 **Residual risk worth naming.** The self-probe opens a loopback connection every 2 minutes. If the httpd's listen backlog is saturated by other clients, the probe's `connect()` can be refused; three consecutive refusals (6 min) mark the server as wedged, and with the camera counter healthy the device would classify as `wedged` and reboot after the 15-minute dwell. With `max_open_sockets = 12` and one WebSocket viewer per device this is unlikely, but it is a false-positive path that only hardware testing will settle.
 
 **L14** (agent, delivery note): The liveness work already on this branch and the self-recovery work ship as ONE branch and ONE firmware image, per S17 — there is no OTA partition, so a second firmware PR would cost a second serial flash round on all three devices. The branch was rebased onto `main` @ `ec39d6b` with no conflicts (`embedded/` had not changed since the branch's base `0d9e9ba`).
+
+**L15** (agent, delivery strategy — commit slice boundary). The branch carries two features (the liveness work that was already on it, and this one) and totals ~2 000 authored changed lines against `main`, which exceeds the ~400-line reviewable-slice guidance for a branch. That is deliberate, per S17: one firmware image means one serial flash round for three devices, and there is no OTA partition to land a second image. The slice boundary is therefore at the **feature**, not the branch. Each individual commit is a work unit inside its feature:
+
+| Commit | Work unit | Lines |
+|---|---|---|
+| `0c9794e` | spec correction + implementation record (this document) | ~40 |
+| `be001e5` | the escalation ladder, the liveness signals, the NVS recovery (T1–T5) | ~420 |
+| `75f41b0` | `/health` exposes the recovery state (T6) | ~45 |
+| `319ee3d` | operator documentation (T7) | ~150 |
+
+The pre-existing liveness commits (`7a4bab0` … `e0e4147`) are that feature's own work units and are unchanged by this work. A reviewer should read the two features as two slices of the branch, not one 2 000-line diff.
