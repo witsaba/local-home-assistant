@@ -55,13 +55,10 @@
 #include "cam_reader.h"
 #include "ws_cams.h"
 
-/* Forward declarations for provisioning diagnostics accessors.
- * These live in provisioning.c behind provisioning.h's public
- * seam so they are accessible to /health without pulling esp_wifi
- * into the sta_server TU. */
-extern const char  *prov_fw_version(void);
-extern uint32_t    provisioning_reconnect_count(void);
-extern uint8_t     provisioning_last_disconnect_reason(void);
+/* The provisioning component's public seam. provisioning.h pulls in
+ * only <stddef.h>, <stdbool.h> and <esp_err.h>, so it is safe to
+ * include here: the accessors below live behind it. */
+#include "provisioning.h"
 
 /* Forward declaration for the ws_cams viewer fd accessor. */
 extern int ws_cams_viewer_fd_get(void);
@@ -146,11 +143,30 @@ static esp_err_t health_get_handler(httpd_req_t *req)
     int      ws_fd     = ws_cams_viewer_fd_get();
     int      ws_viewer = (ws_fd >= 0) ? 1 : 0;
 
-    char buf[256];
+    /* Self-recovery state. The outage class is the field an
+     * operator reads first: "router_absent" means the environment
+     * is at fault and the device is waiting politely, "link_failed"
+     * and "wedged" mean the device is escalating on its own. */
+    const char *outage   = provisioning_outage_class_name(
+                                provisioning_outage_class());
+    uint32_t    outage_ms = provisioning_outage_elapsed_ms();
+    uint32_t    boots     = provisioning_boot_count();
+    uint32_t    backoff   = provisioning_reboot_backoff_ms();
+    uint8_t     reset_rsn = provisioning_last_reset_reason();
+    uint8_t     reboot_rsn= provisioning_reboot_reason();
+    int         probe_ok  = provisioning_self_probe_ok() ? 1 : 0;
+    uint32_t    frames    = provisioning_frames_captured();
+    uint32_t    drops     = provisioning_frames_dropped();
+
+    char buf[640];
     int len = snprintf(buf, sizeof(buf),
         "{\"uptime_ms\":%lu,\"free_heap\":%lu,\"min_free_heap\":%lu,"
         "\"free_psram\":%lu,\"ip\":\"%s\",\"rssi\":%d,"
-        "\"reconnect_count\":%lu,\"last_disconn_rc\":%u,\"ws_viewer\":%d}",
+        "\"reconnect_count\":%lu,\"last_disconn_rc\":%u,\"ws_viewer\":%d,"
+        "\"outage\":\"%s\",\"outage_ms\":%lu,\"unhealthy_boots\":%lu,"
+        "\"backoff_ms\":%lu,\"self_probe_ok\":%d,"
+        "\"frames_captured\":%lu,\"frames_dropped\":%lu,"
+        "\"reset_reason\":%u,\"reboot_reason\":%u}",
         (unsigned long)uptime_ms,
         (unsigned long)free_heap,
         (unsigned long)min_free_heap,
@@ -159,7 +175,16 @@ static esp_err_t health_get_handler(httpd_req_t *req)
         rssi,
         (unsigned long)reconn,
         (unsigned)disconn,
-        ws_viewer);
+        ws_viewer,
+        outage,
+        (unsigned long)outage_ms,
+        (unsigned long)boots,
+        (unsigned long)backoff,
+        probe_ok,
+        (unsigned long)frames,
+        (unsigned long)drops,
+        (unsigned)reset_rsn,
+        (unsigned)reboot_rsn);
 
     if (len < 0 || (size_t)len >= sizeof(buf)) {
         httpd_resp_set_status(req, "500 Internal Server Error");
