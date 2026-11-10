@@ -55,17 +55,25 @@ The Pi stops polling a device that has been unreachable for 5 minutes
 remediation job would therefore never see a dead device. The device MUST detect its own
 illness with no network, no PC and no Pi involved.
 
-**S10 — Two independent liveness signals, both required to be stale before escalating.**
+**S10 — Two independent liveness signals; either one being stale is a fault, and neither may require an external client.**
   - (a) Camera progress: `cam_reader_frames_captured_get()` must keep advancing
-    (`components/cam_reader/cam_reader.c:118`). It advances on every capture attempt
-    regardless of whether a viewer is connected, so it detects a wedged camera or sensor bus.
-    A camera that is failing (`ESP_FAIL` from `esp_camera_fb_get`) advances
-    `cam_reader_fb_drops_get()` instead of `cam_reader_frames_captured_get()`.
+    (`components/cam_reader/cam_reader.c:118`). It advances on every successful capture
+    regardless of whether a viewer is connected, so it detects a wedged camera or a stuck
+    capture path. The signal is stale only when NEITHER `cam_reader_frames_captured_get()`
+    NOR `cam_reader_fb_drops_get()` (`cam_reader.c:123`) has moved for the staleness window.
+    A dead sensor keeps raising the drop counter, so a broken sensor is REPORTED but never
+    triggers a reboot — a reboot cannot fix a dead sensor, and rebooting for it would loop
+    forever. Only a capture path that has stopped moving entirely (task wedged, camera mutex
+    stuck) counts as stale.
   - (b) HTTP self-probe: the supervisor MUST periodically issue a loopback `GET /health`
     against `127.0.0.1` and require a response. A camera that is healthy but whose HTTP
     server is wedged still advances signal (a), so signal (a) alone cannot detect a wedged
-    httpd. Both signals must be stale before the device escalates.
-  Neither signal may require an external client.
+    httpd; conversely signal (b) alone cannot detect a wedged camera. Either signal being
+    stale classifies the device as `WEDGED` and starts the escalation.
+  Neither signal may require an external client, a PC, or the Pi.
+  **Correction (L11):** an earlier draft of this spec said both signals must be stale before
+  escalating. That is wrong — it would make a wedged HTTP server undetectable, because a
+  healthy camera keeps signal (a) moving. The rule is "either signal stale is a fault".
 
 **S11 — A reboot storm guard is mandatory.**
 Reboots MUST be rate-limited by a persisted counter so that a device which reboots and is
@@ -147,3 +155,26 @@ together in one branch and one image, not as two PRs requiring two flash rounds.
 **L9** (agent, decision): The liveness work and this self-recovery work ship as ONE branch and ONE firmware image, per S17 — no OTA partition means each firmware PR costs a serial flash of three devices.
 
 **L10** (agent, decision): The reboot is placed ABOVE the existing ceiling-free reconnect retry, never instead of it, per S5 and S6. The `ROUTER_ABSENT` class is explicitly excluded from the reboot step: rebooting cannot make a router come alive, and under a long power event it produces a storm indistinguishable from the original fault.
+
+**L11** (agent, correction): S10 was internally inconsistent as first written — "both signals must be stale" would have made a wedged HTTP server undetectable, because a healthy camera keeps the frame counter moving. S10 now reads "either signal stale is a fault", and the camera signal is defined as "neither the captured-frame counter NOR the dropped-frame counter moved", so a dead sensor is reported but never rebooted (a reboot cannot fix a dead sensor and would loop forever).
+
+**L12** (agent, implementation note): The self-probe uses a raw lwIP socket rather than `esp_http_client`, so the firmware gains no new managed dependency; `lwip` was added to the provisioning component's REQUIRES for it. The probe carries `SO_RCVTIMEO`/`SO_SNDTIMEO` so a wedged server cannot hang the supervisor task. `connect()` on loopback is not bounded by those timeouts — lwIP applies its own TCP retransmit schedule — so a fully wedged listener can stall the supervisor for a few seconds; the supervisor tick is 30 s, so this is absorbed.
+
+**L13** (agent, implementation record and build evidence). Tasks T1–T7 implemented in `components/provisioning/` plus the operator README; T8 verified.
+
+- T1 → `provisioning_init()`: an unusable NVS is now erased and re-initialised instead of returning an error, so `app_main` can no longer bail on `ESP_ERR_NVS_CORRUPT`. The device comes up in SoftAP provisioning mode instead of being inert. The old `return er` / `return nv` paths are gone. (S12)
+- T2 → NVS namespace `selfrec` (`boot_count`, `reboot_pending`, `reboot_reason`), `selfrec_load()` / `selfrec_save()`, `reboot_backoff_ms()` doubling 15→30→60→120→240 min and capped, counter cleared by `note_healthy()` after 10 healthy minutes. (S11, S13)
+- T3 → `classify_outage()` returns `none` / `router_absent` / `link_failed` / `wedged` from `s_last_disconnect_reason` and the two liveness signals. `WIFI_REASON_NO_AP_FOUND` (201) and reason 0 map to `router_absent`. (S6, S16)
+- T4 → the ladder in `provisioning_supervise_sta()`: the existing `sta_reconnect_task` is step 1 and is untouched (no attempt ceiling added), step 2 is `esp_wifi_disconnect()` + `esp_wifi_connect()` after 2 min, step 3 is `esp_restart()` after 15 min **and** after this boot has lasted the persisted backoff. `router_absent` returns before step 2 — it can never reach a reboot. (S5, S6, S7)
+- T5 → `camera_path_stuck()` (stale only when neither the captured-frame nor the dropped-frame counter moved for 10 min) and `http_self_probe()` (loopback `GET /health` over a raw lwIP socket, 3 s socket timeouts, every 2 min, 3 consecutive failures to call the server wedged). (S8, S9, S10)
+- T6 → `/health` gained `outage`, `outage_ms`, `unhealthy_boots`, `backoff_ms`, `self_probe_ok`, `frames_captured`, `frames_dropped`, `reset_reason`, `reboot_reason`; the JSON buffer grew 256 → 640 bytes; the endpoint still never returns 500. (S14)
+- T7 → `esp_reset_reason()` logged at boot (`init: reset reason = <n>`), and a new README section documenting the ladder, the outage classes, the backoff table, the liveness signals and what the feature does not fix. (S15, S16)
+
+**T8 verification.**
+- Clean build: `rm -rf build sdkconfig && idf.py build` → **exit 0, zero `warning:` lines, zero `error:` lines** (ESP-IDF v5.5.3, `idf5.5_py3.14_env`). `iot_cams.bin` = **0x102a30 bytes**, 33 % free on the 1.5 MB factory partition (baseline on this branch was 0x100a50 — **+8 240 bytes**).
+- Differential check on the Pi-facing surface, against the pre-change commit `34e27d9`: `ws_cams.c` is **byte-identical** (the whole `/ws/cams` endpoint), and in `sta_server.c` the functions `whoami_get_handler`, `capture_get_handler`, `sta_server_start` and `sta_server_stop` are each **byte-identical**. Only the `/health` handler and the include block changed. `/whoami`, `/capture` (including `?flash=1`) and `/ws/cams` are unchanged.
+- **Not verified:** no hardware. Runtime behaviour — the reconnect task attaching after a late router, the classification in the field, the self-probe against a live httpd, and the reboot itself — is operator-gated: there is no OTA partition, so all three devices need one serial flash.
+
+**Residual risk worth naming.** The self-probe opens a loopback connection every 2 minutes. If the httpd's listen backlog is saturated by other clients, the probe's `connect()` can be refused; three consecutive refusals (6 min) mark the server as wedged, and with the camera counter healthy the device would classify as `wedged` and reboot after the 15-minute dwell. With `max_open_sockets = 12` and one WebSocket viewer per device this is unlikely, but it is a false-positive path that only hardware testing will settle.
+
+**L14** (agent, delivery note): The liveness work already on this branch and the self-recovery work ship as ONE branch and ONE firmware image, per S17 — there is no OTA partition, so a second firmware PR would cost a second serial flash round on all three devices. The branch was rebased onto `main` @ `ec39d6b` with no conflicts (`embedded/` had not changed since the branch's base `0d9e9ba`).
